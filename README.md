@@ -1,5 +1,5 @@
 🌍 Energy Forecasting Pipeline  
-A structured, end-to-end time series forecasting pipeline for German electricity load and renewable generation, combining data engineering, feature engineering, classical machine learning, and foundation models.
+A structured, end-to-end time series forecasting pipeline for German electricity load and renewable generation, combining data engineering and machine learning.
 
 This project builds a reproducible workflow from raw energy + weather data to multi-horizon forecasting, integrating domain-driven features with modern modeling approaches.
 
@@ -30,7 +30,7 @@ This project builds a reproducible workflow from raw energy + weather data to mu
 - Evaluation using MAE, RMSE, MAPE, R², SMAPE  
 - Outputs: benchmark tables, plots, trained models  
 
-**Phase 4 — Foundation Models**  
+**Phase 4 — Foundation Models**  (work in progress)
 - Chronos (pre-trained time series foundation model)  
 - Zero-shot forecasting vs fine-tuned performance  
 - Comparative evaluation against classical baselines  
