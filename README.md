@@ -1,2 +1,97 @@
-# energy-forecast
-End-to-end time series forecasting pipeline for electricity load and renewable generation using feature engineering, XGBoost, SARIMA, and foundation models.
+🌍 Energy Forecasting Pipeline  
+A structured, end-to-end time series forecasting pipeline for German electricity load and renewable generation, combining data engineering, feature engineering, classical machine learning, and foundation models.
+
+This project builds a reproducible workflow from raw energy + weather data to multi-horizon forecasting, integrating domain-driven features with modern modeling approaches.
+
+---
+
+🔧 Overview  
+
+**Phase 1 — Data Ingestion (Python)**  
+- Integration of multi-source datasets: OPSD, SMARD, Meteostat  
+- Hourly time-series alignment (UTC)  
+- Gap handling and data validation  
+- Output: unified master dataset (~80k rows, ~30 columns)  
+
+**Phase 2 — Feature Engineering**  
+- Calendar-based features (hour, weekday, seasonality, holidays)  
+- Weather-derived signals (degree-days, wind power density, solar proxies)  
+- Temporal features (lags, rolling statistics, differences)  
+- Output: model-ready dataset (~150 features)  
+
+**Phase 2.5 — Data Splitting & Scaling**  
+- Chronological split into train / validation / test sets  
+- Independent scaling to prevent data leakage  
+- Configurable normalization strategies  
+
+**Phase 3 — Baseline Models**  
+- XGBoost (multi-horizon direct forecasting)  
+- SARIMA (univariate statistical baseline)  
+- Evaluation using MAE, RMSE, MAPE, R², SMAPE  
+- Outputs: benchmark tables, plots, trained models  
+
+**Phase 4 — Foundation Models**  
+- Chronos (pre-trained time series foundation model)  
+- Zero-shot forecasting vs fine-tuned performance  
+- Comparative evaluation against classical baselines  
+- Outputs: leaderboard, evaluation plots, checkpoints  
+
+---
+
+🎯 Purpose  
+- Build a full-stack time series forecasting pipeline  
+- Compare classical ML, statistical models, and foundation models  
+- Explore the impact of feature engineering on energy forecasting  
+- Develop reproducible, production-style data workflows  
+
+---
+
+⚡ Skills Demonstrated  
+- Time-series data engineering and pipeline design  
+- Multi-source data integration and validation  
+- Feature engineering with domain knowledge (energy + weather)  
+- Multi-horizon forecasting techniques  
+- Model evaluation and benchmarking  
+- Cross-approach modeling (XGBoost, SARIMA, foundation models)  
+
+---
+
+📊 Data Sources  
+- Open Power System Data (OPSD) — load & generation  
+- SMARD (Bundesnetzagentur) — validation overlay  
+- Meteostat — weather observations (multi-station aggregation)  
+
+---
+
+📈 Key Outputs  
+- Cleaned master dataset (`master.parquet`)  
+- Feature-engineered dataset (`features.parquet`)  
+- Baseline benchmark results (`baseline_table.csv`)  
+- Model comparison leaderboard (`leaderboard.csv`)  
+- Forecast visualizations and evaluation plots  
+
+---
+🧠 Project Structure  
+The repository is organized into modular components reflecting each stage of the forecasting pipeline:
+src/
+├── ingest/ # Data ingestion and merging (OPSD, SMARD, Meteostat)
+├── features/ # Feature engineering (calendar, weather, temporal)
+├── models/ # Baseline and foundation model implementations
+│ ├── xgboost_model.py
+│ ├── arima.py
+│ └── evaluate_all.py
+notebooks/
+├── 03_baselines.ipynb # Baseline model experiments and evaluation
+├── 04_foundation.ipynb # Foundation model (Chronos) experiments
+data/
+├── processed/ # Cleaned and transformed datasets (parquet files)
+results/
+├── baseline_plots/ # Evaluation plots for baseline models
+├── metrics/ # JSON/CSV metric logs
+├── leaderboards/ # Model comparison outputs
+models/
+├── baselines/ # Saved trained baseline models (checkpoints)
+---
+
+🚧 Status  
+Work in progress — actively expanding feature engineering, improving model performance, and experimenting with foundation model fine-tuning.
