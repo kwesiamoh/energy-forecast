@@ -73,4 +73,4 @@ This project builds a reproducible workflow from raw energy + weather data to mu
 ---
 
 🚧 Status  
-Work in progress — actively expanding feature engineering, improving model performance, and experimenting with foundation model fine-tuning.
+Work in progress
