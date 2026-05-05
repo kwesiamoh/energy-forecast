@@ -71,27 +71,6 @@ This project builds a reproducible workflow from raw energy + weather data to mu
 - Forecast visualizations and evaluation plots  
 
 ---
-🧠 Project Structure  
-The repository is organized into modular components reflecting each stage of the forecasting pipeline:
-src/
-├── ingest/ # Data ingestion and merging (OPSD, SMARD, Meteostat)
-├── features/ # Feature engineering (calendar, weather, temporal)
-├── models/ # Baseline and foundation model implementations
-│ ├── xgboost_model.py
-│ ├── arima.py
-│ └── evaluate_all.py
-notebooks/
-├── 03_baselines.ipynb # Baseline model experiments and evaluation
-├── 04_foundation.ipynb # Foundation model (Chronos) experiments
-data/
-├── processed/ # Cleaned and transformed datasets (parquet files)
-results/
-├── baseline_plots/ # Evaluation plots for baseline models
-├── metrics/ # JSON/CSV metric logs
-├── leaderboards/ # Model comparison outputs
-models/
-├── baselines/ # Saved trained baseline models (checkpoints)
----
 
 🚧 Status  
 Work in progress — actively expanding feature engineering, improving model performance, and experimenting with foundation model fine-tuning.
