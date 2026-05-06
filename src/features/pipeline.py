@@ -13,8 +13,8 @@ Pipeline steps (in order):
   6. Validate: check for inf, report NaN%
   7. Save feature parquet to processed/features.parquet
 
-The pipeline is idempotent: running it twice with force=False reads the
-cache. Set force=True to recompute (e.g. after changing feature definitions).
+Running pipeline twice with force=False reads the cache.
+Set force=True to recompute (e.g. after changing feature definitions).
 
 Column groups (for downstream use in models):
   TARGET_COLS  – what we want to predict
