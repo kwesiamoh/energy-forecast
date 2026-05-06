@@ -124,8 +124,16 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
     exclude = set(TARGET_COLS)
     exclude.update(c for c in df.columns if "_smard" in c)
     # Per-station weather cols (berlin_temp, etc.) — composites start with de_
-    station_names = ["berlin", "frankfurt", "munich", "hamburg", "stuttgart"]
-    for station in station_names:
+    # Dynamically detect station prefixes (not 'de_', not calendar features)
+    known_non_station_prefixes = {
+        'hour', 'month', 'year', 'season', 'is', 'quarter'}
+    station_prefixes = set()
+    for col in df.columns:
+        if '_' in col and not col.startswith('de_') and '_smard' not in col:
+            prefix = col.split('_')[0]
+            if prefix not in known_non_station_prefixes and prefix not in TARGET_COLS:
+                station_prefixes.add(prefix)
+    for station in station_prefixes:
         exclude.update(c for c in df.columns if c.startswith(f"{station}_"))
 
     return [c for c in df.columns if c not in exclude]
@@ -139,7 +147,8 @@ def _validate(df: pd.DataFrame) -> None:
     numeric = df.select_dtypes(include=[np.floating])
     inf_cols = [c for c in numeric.columns if np.isinf(numeric[c]).any()]
     if inf_cols:
-        logger.warning("Inf values found in columns: %s — replacing with NaN.", inf_cols)
+        logger.warning(
+            "Inf values found in columns: %s — replacing with NaN.", inf_cols)
         df[inf_cols] = df[inf_cols].replace([np.inf, -np.inf], np.nan)
 
     # NaN report
