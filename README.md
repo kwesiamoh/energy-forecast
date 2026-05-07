@@ -1,76 +1,143 @@
-🌍 Energy Forecasting Pipeline  
-A structured, end-to-end time series forecasting pipeline for German electricity load and renewable generation, combining data engineering and machine learning.
+# 🌍 Energy and Carbon Intensity Forecasting Pipeline  
 
-This project builds a reproducible workflow from raw energy + weather data to multi-horizon forecasting, integrating domain-driven features with modern modeling approaches.
+This project is an end-to-end time series forecasting pipeline for the German power grid. It predicts electricity demand and generation, and extends this by estimating the real-time carbon intensity of the grid (gCO2eq/kWh).
 
----
-
-🔧 Overview  
-
-**Phase 1 — Data Ingestion (Python)**  
-- Integration of multi-source datasets: OPSD, SMARD, Meteostat  
-- Hourly time-series alignment (UTC)  
-- Gap handling and data validation  
-- Output: unified master dataset (~80k rows, ~30 columns)  
-
-**Phase 2 — Feature Engineering**  
-- Calendar-based features (hour, weekday, seasonality, holidays)  
-- Weather-derived signals (degree-days, wind power density, solar proxies)  
-- Temporal features (lags, rolling statistics, differences)  
-- Output: model-ready dataset (~150 features)  
-
-**Phase 2.5 — Data Splitting & Scaling**  
-- Chronological split into train / validation / test sets  
-- Independent scaling to prevent data leakage  
-- Configurable normalization strategies  
-
-**Phase 3 — Baseline Models**  
-- XGBoost (multi-horizon direct forecasting)  
-- SARIMA (univariate statistical baseline)  
-- Evaluation using MAE, RMSE, MAPE, R², SMAPE  
-- Outputs: benchmark tables, plots, trained models  
-
-**Phase 4 — Foundation Models**  (work in progress)
-- Chronos (pre-trained time series foundation model)  
-- Zero-shot forecasting vs fine-tuned performance  
-- Comparative evaluation against classical baselines  
-- Outputs: leaderboard, evaluation plots, checkpoints  
+The idea is to combine energy system data with weather data and use machine learning to understand not just how much electricity is produced, but also how carbon-intensive it is over time.
 
 ---
 
-🎯 Purpose  
-- Build a full-stack time series forecasting pipeline  
-- Compare classical ML, statistical models, and foundation models  
-- Explore the impact of feature engineering on energy forecasting  
-- Develop reproducible, production-style data workflows  
+## 🔧 Overview  
+
+### ⚡ Phase 1 — Data Ingestion and Energy System Setup  
+- Integration of multiple datasets: OPSD, SMARD, Meteostat  
+- Full German generation mix included:
+  - Lignite, Coal, Gas, Nuclear  
+  - Wind, Solar, Biomass, Run-of-River, Pumped Storage  
+- Separation between:
+  - data ingestion (APIs / downloads)  
+  - merging and backfilling logic  
+- Hourly alignment (UTC), gap handling, and validation  
+
+Derived quantities:
+- Total generation  
+- Residual load  
+- Carbon emissions using emission factors → carbon intensity (gCO2eq/kWh)  
+
+Output: unified dataset (~80k rows, ~30+ columns)
 
 ---
 
-⚡ Skills Demonstrated  
-- Time-series data engineering and pipeline design  
-- Multi-source data integration and validation  
-- Feature engineering with domain knowledge (energy + weather)  
-- Multi-horizon forecasting techniques  
+### 🧠 Phase 2 — Feature Engineering  
+- Calendar features (hour, weekday, seasonality, holidays)  
+- Weather-based features:
+  - temperature → degree-days  
+  - wind → power density (∝ velocity³)  
+  - solar proxies  
+
+- Temporal features:
+  - lagged values  
+  - rolling statistics  
+  - differences  
+
+- Strict causal setup:
+  - only past information is used  
+  - prevents data leakage  
+
+- Handling missing data:
+  - removal of highly sparse sensors  
+  - preservation of usable samples  
+
+Output: model-ready dataset (~150 features)
+
+---
+
+### ⚙️ Phase 2.5 — Data Splitting and Scaling  
+- Chronological split into train / validation / test  
+- No shuffling (time order preserved)  
+- Independent scaling to avoid leakage  
+- Configurable normalization  
+
+---
+
+### 📊 Phase 3 — Baseline Models  
+- XGBoost (multi-horizon forecasting)  
+- SARIMA (statistical baseline)  
+
+Forecast targets:
+- Grid load (MW)  
+- Carbon intensity (gCO2eq/kWh)  
+
+Evaluation:
+- MAE, RMSE, MAPE, SMAPE, R²  
+
+Outputs:
+- Benchmark tables  
+- Evaluation plots  
+- Trained models  
+
+---
+
+### 🤖 Phase 4 — Foundation Models (WIP)  
+- Chronos (pre-trained time series model)  
+- Comparison of:
+  - zero-shot predictions  
+  - fine-tuned models  
+
+Focus:
+- Generalization across time  
+- Comparison with classical baselines  
+
+Outputs:
+- Model leaderboard  
+- Evaluation plots  
+
+---
+
+## 🎯 Purpose  
+
+- Build a full pipeline from raw data to forecasting  
+- Predict both energy demand and grid carbon intensity  
+- Understand how the energy mix affects emissions  
+- Compare statistical models, ML models, and foundation models  
+- Keep everything reproducible and structured  
+
+---
+
+## ⚡ Skills Demonstrated  
+
+- Time-series data processing and pipeline design  
+- Integration of real-world energy and weather datasets  
+- Feature engineering based on physical relationships  
+- Prevention of data leakage in forecasting  
+- Multi-horizon forecasting  
 - Model evaluation and benchmarking  
-- Cross-approach modeling (XGBoost, SARIMA, foundation models)  
+
+Additional focus:
+- Energy system understanding (generation mix, residual load)  
+- Linking environmental/process engineering with ML  
 
 ---
 
-📊 Data Sources  
-- Open Power System Data (OPSD) — load & generation  
-- SMARD (Bundesnetzagentur) — validation overlay  
-- Meteostat — weather observations (multi-station aggregation)  
+## 📊 Data Sources  
+
+- Open Power System Data (OPSD) — load and generation  
+- SMARD (Bundesnetzagentur) — German grid data  
+- Meteostat — weather data  
+
+All data sources are open and properly attributed in the repository.
 
 ---
 
-📈 Key Outputs  
-- Cleaned master dataset (`master.parquet`)  
-- Feature-engineered dataset (`features.parquet`)  
-- Baseline benchmark results (`baseline_table.csv`)  
-- Model comparison leaderboard (`leaderboard.csv`)  
-- Forecast visualizations and evaluation plots  
+## 📈 Key Outputs  
+
+- `master.parquet` — cleaned dataset  
+- `features.parquet` — feature dataset  
+- `baseline_table.csv` — model benchmarks  
+- `leaderboard.csv` — model comparison  
+- Forecast plots for load and carbon intensity  
 
 ---
 
-🚧 Status  
-Work in progress
+## 🚧 Status  
+
+Work in progress. Currently extending model comparison and improving evaluation.
