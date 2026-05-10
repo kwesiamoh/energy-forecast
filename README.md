@@ -50,8 +50,7 @@ Output: unified dataset (~80k rows, ~30+ columns)
   - preservation of usable samples  
 
 #### 🕵️‍♂️ Missing Data & Sensor Auditing  
-
-
+<img width="3034" height="1534" alt="missing_data_heatmap" src="https://github.com/user-attachments/assets/218cd5ae-ac92-43ef-bff3-70a7f985154b" />
 
 *Auditing sensor downtime across the 8-year timeline before executing forward-filling and interpolation.*
 
