@@ -223,8 +223,7 @@ def add_all_temporal_features(
         df with all temporal features appended.
     """
     if targets is None:
-        # Include all available target candidates, including full SMARD mix
-        # and the carbon intensity target added for the thesis.
+        # Include all available target candidates, including full SMARD mix and the carbon intensity target added.
         # The four SMARD minor-renewable series are added here to match the
         # expanded TARGET_COLS in pipeline.py — temporal features are generated
         # for them automatically without requiring any notebook changes.
@@ -239,7 +238,6 @@ def add_all_temporal_features(
             # Remaining SMARD generation mix (for full-mix modelling)
             "biomass_mw", "run_of_river_mw", "nuclear_mw",
             "lignite_mw", "hard_coal_mw", "gas_mw",
-            # Derived thesis target
             "carbon_intensity_g_kwh",
         ]
         targets = [c for c in candidates if c in df.columns]
