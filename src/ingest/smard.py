@@ -50,7 +50,7 @@ Carbon intensity:
   Each fuel type is multiplied by a standard lifecycle emission factor
   (g CO₂-eq / kWh) and the sum is divided by total generation.  This gives
   an hourly grid carbon intensity signal useful as both a feature and a
-  target for the thesis's carbon-aware forecasting component.
+  target for the carbon-aware forecasting component.
 
   Emission factors (g CO₂-eq / kWh, lifecycle median values):
     Lignite (brown coal) : 1000
