@@ -45,8 +45,7 @@ data.  The notebook cells call this before .corr().
 New target: carbon_intensity_g_kwh
 ═══════════════════════════════════════════════════════════════════════════════
 Added to TARGET_COLS so that temporal.py automatically generates lag, rolling,
-and diff features for it.  This supports the thesis's carbon-aware forecasting
-component without requiring any changes to the notebook or model code.
+and diff features for it.
 
 ═══════════════════════════════════════════════════════════════════════════════
 Expanded TARGET_COLS — full renewable mix forecasting
@@ -118,8 +117,7 @@ SMARD_TARGET_COLS = [
 
 # Default target set — OPSD primaries (SMARD-backfilled post-2020) plus the
 # four minor renewable series sourced directly from SMARD (continuous coverage
-# 2015 → present, no backfill gap) plus carbon intensity for the thesis's
-# carbon-aware forecasting component.
+# 2015 → present, no backfill gap) plus carbon intensity for the carbon-aware forecasting component.
 #
 # SMARD columns are used for the minor renewables rather than the OPSD
 # equivalents because the OPSD series go NaN after October 2020, which would
@@ -130,7 +128,6 @@ TARGET_COLS: list[str] = OPSD_TARGET_COLS + [
     "run_of_river_mwh_smard",
     "pumped_storage_gen_mwh_smard",
     "other_renewables_mwh_smard",
-    # Derived thesis target
     "carbon_intensity_g_kwh",
 ]
 
