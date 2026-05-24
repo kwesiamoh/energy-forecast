@@ -1,217 +1,315 @@
-# 🌍 Energy and Carbon Intensity Forecasting Pipeline  
+# 🌍 Energy and Carbon Intensity Forecasting Pipeline
 
-This project is an end-to-end time series forecasting system for the German power grid. It predicts electricity demand and generation, and extends this by estimating the real-time carbon intensity of the grid (gCO2eq/kWh).
+This project builds an end-to-end forecasting pipeline for the German power grid.
 
-The pipeline combines energy system data with weather data and applies both classical machine learning and modern foundation models. The goal is to understand not only how much electricity is produced, but also how carbon-intensive it is, and how different modeling approaches handle this problem.
+The work focuses on two connected questions:
+
+1. How much electricity will the grid need?
+2. How carbon-intensive will that electricity be?
+
+Instead of treating electricity demand as a purely numerical forecasting task, this project links demand, generation mix, weather conditions, and emissions into one structured pipeline. The aim is to forecast not only grid load, but also the carbon intensity of electricity in real time, measured in gCO₂eq/kWh.
+
+This makes the problem more practical: electricity is not equally clean at every hour of the day. A kilowatt-hour consumed during high renewable generation can have a very different emissions impact from one consumed during fossil-heavy periods.
 
 ---
 
-## 🔧 Overview  
+## 🔧 Overview
 
-### ⚡ Phase 1 — Data Ingestion and Energy System Setup  
-- Integration of multiple datasets: OPSD, SMARD, Meteostat  
-- Full German generation mix included:
-  - Lignite, Coal, Gas, Nuclear  
-  - Wind, Solar, Biomass, Run-of-River, Pumped Storage  
-- Clean separation between ingestion and merging/backfilling logic  
-- Hourly alignment (UTC), gap handling, validation  
+The pipeline combines German power system data, weather data, physical feature engineering, classical machine learning, and time-series foundation models.
 
-Derived quantities:
-- Total generation  
-- Residual load  
-- Carbon emissions → carbon intensity (gCO2eq/kWh)  
+It follows the full workflow from raw data ingestion to model evaluation:
 
-Output: unified dataset (~80k rows, ~30+ columns)
+- collecting and aligning grid and weather data
+- estimating emissions and carbon intensity
+- engineering physically meaningful forecasting features
+- training baseline forecasting models
+- comparing classical machine learning with a pre-trained foundation model
+- analyzing forecast stability, error propagation, and grid-level carbon patterns
 
-#### 📊 Macro Dataset Overview  
+---
+
+## ⚡ Phase 1 — Data Ingestion and Energy System Setup
+
+The first step was to build a reliable hourly dataset for the German power grid.
+
+I combined multiple open datasets, including OPSD, SMARD, and Meteostat, and aligned them into a common hourly UTC timeline.
+
+The dataset includes the main components of the German generation mix:
+
+- lignite
+- hard coal
+- gas
+- nuclear
+- wind
+- solar
+- biomass
+- run-of-river hydro
+- pumped storage
+
+From these raw inputs, the pipeline derives several quantities that are important for both forecasting and interpretation:
+
+- total electricity generation
+- residual load
+- estimated carbon emissions
+- carbon intensity in gCO₂eq/kWh
+
+The result is a unified dataset with roughly 80,000 hourly observations and more than 30 core variables.
+
+#### 📊 Macro Dataset Overview
+
 <img width="3634" height="1534" alt="macro_overview" src="https://github.com/user-attachments/assets/a5cd8fe9-e5f7-4b26-9f8a-665142d73bc8" />
 
-
 ---
 
-### 🧠 Phase 2 — Feature Engineering  
-- Calendar features (hour, weekday, seasonality, holidays)  
-- Weather-based features:
-  - temperature → degree-days  
-  - wind → power density (∝ velocity³)  
-  - solar proxies  
+## 🧠 Phase 2 — Feature Engineering
 
-- Temporal features:
-  - lagged values  
-  - rolling statistics  
-  - differences  
+After building the core dataset, I developed a feature engineering layer for time-series forecasting.
 
-- Strict causal setup:
-  - only past information is used  
-  - prevents data leakage  
+The features are designed to capture three types of structure:
 
-- Handling missing data:
-  - removal of highly sparse sensors  
-  - preservation of usable samples  
+### Calendar structure
 
-#### 🕵️‍♂️ Missing Data & Sensor Auditing  
+Electricity demand follows strong daily, weekly, and seasonal rhythms, so the pipeline includes:
+
+- hour of day
+- weekday
+- weekend indicators
+- seasonal patterns
+- holiday effects
+
+### Weather-driven structure
+
+Weather affects both electricity demand and renewable generation. The pipeline includes features such as:
+
+- temperature-based heating and cooling degree indicators
+- wind power density proxies based on wind speed
+- solar-related proxies
+- weather station aggregation and validation
+
+### Temporal structure
+
+To help the models learn from recent system behavior, the pipeline adds:
+
+- lagged values
+- rolling statistics
+- differences
+- historical target behavior
+
+A strict causal setup is used throughout. The model only receives information that would have been available at prediction time. This avoids data leakage and keeps the forecasting problem realistic.
+
+#### 🕵️‍♂️ Missing Data & Sensor Auditing
+
 <img width="3034" height="1534" alt="missing_data_heatmap" src="https://github.com/user-attachments/assets/218cd5ae-ac92-43ef-bff3-70a7f985154b" />
 
-*Auditing sensor downtime across the 8-year timeline before executing forward-filling and interpolation.*
+*Sensor availability was audited across the full 8-year timeline before applying forward-filling, interpolation, and sparse-sensor filtering.*
 
-Output: model-ready dataset (~150 features)
-
----
-
-### ⚙️ Phase 2.5 — Data Splitting and Scaling  
-- Chronological train / validation / test split  
-- No shuffling (time order preserved)  
-- Independent scaling to avoid leakage  
+The final feature-engineered dataset contains around 150 model-ready features.
 
 ---
 
-### 📊 Phase 3 — Baseline Models (XGBoost Refactor)  
-- XGBoost (recursive multi-step forecasting)  
-- SARIMA (statistical baseline)  
+## ⚙️ Phase 2.5 — Data Splitting and Scaling
 
-Forecast targets:
-- Grid load (MW)  
-- Carbon intensity (gCO2eq/kWh)  
+The data is split chronologically into training, validation, and test sets.
 
-#### 🔁 Recursive Rollout Strategy  
-The XGBoost model was refactored to use a recursive rollout approach:
-- trained on a single-step horizon (h = 1)  
-- predictions fed back into lag features for multi-step forecasting  
+No shuffling is used, because time order matters in forecasting. The model is evaluated on future periods that were not seen during training.
 
-This resolved the initial flat prediction issue, but revealed a key limitation:
-
-> prediction errors compound over time, leading to drift across the 24-hour horizon  
-
-This behavior is typical for tree-based models in autoregressive setups.
+Scaling is also handled carefully to prevent leakage between training and evaluation periods.
 
 ---
 
-### 🤖 Phase 4 — Foundation Model (Chronos-T5)  
+## 📊 Phase 3 — Baseline Models
 
-- Amazon Chronos-T5 deployed in zero-shot mode  
-- Uses a 168-hour context window with self-attention  
-- No manual feature engineering required  
+The first modeling stage uses classical forecasting baselines.
 
-Instead of relying on:
-- weather features  
-- calendar features  
-- lag engineering  
+The main machine learning baseline is XGBoost, implemented with a recursive multi-step forecasting strategy. A SARIMA model is also included as a statistical reference point.
 
-the model directly learns temporal structure from raw sequences.
+The forecast targets are:
+
+- grid load in MW
+- carbon intensity in gCO₂eq/kWh
 
 ---
 
-## 📊 Results  
+## 🔁 Recursive Rollout Strategy
 
-### 168-Hour Forecast Comparison  
+The XGBoost model is trained for a one-step-ahead forecast.
+
+To predict multiple hours into the future, the model feeds its own prediction back into the lag features and repeats the process across the forecast horizon.
+
+This solved the initial issue of overly flat predictions, but it also exposed a known limitation of recursive forecasting:
+
+> small errors at early horizons become inputs for later horizons, causing forecast drift over time.
+
+This behavior is especially visible across a 24-hour window. XGBoost can track short-term changes, but its stability decreases as the horizon grows.
+
+---
+
+## 🤖 Phase 4 — Foundation Model: Chronos-T5
+
+To compare the classical approach with a modern sequence model, I tested Amazon Chronos-T5.
+
+Chronos was used in zero-shot mode. It was not fine-tuned on this specific German grid dataset.
+
+Instead of relying on manually engineered features, Chronos receives a 168-hour context window and forecasts directly from the raw time-series sequence.
+
+This creates a useful comparison between two modeling philosophies:
+
+- XGBoost depends on carefully designed domain features.
+- Chronos relies on pre-trained temporal sequence understanding.
+
+The question is whether a foundation model can capture the structure of a physical energy system without requiring hand-built weather, calendar, and lag features.
+
+---
+
+## 📊 Results
+
+### 168-Hour Forecast Comparison
+
 <img width="3634" height="1235" alt="showdown_168h" src="https://github.com/user-attachments/assets/b77a5a2d-be4a-4447-b051-90b6f1dbccba" />
 
+Chronos follows the actual signal more closely across longer horizons.
 
-Chronos tracks the actual signal much more closely over long horizons, while XGBoost gradually diverges due to recursive error accumulation.
+XGBoost performs reasonably in the near term, but gradually moves away from the observed trajectory as recursive errors accumulate.
+
+This difference becomes important when the forecast is used for planning rather than only short-term prediction.
 
 ---
 
-### Horizon Error Propagation  
+### Horizon Error Propagation
+
 <img width="2434" height="1234" alt="horizon_error" src="https://github.com/user-attachments/assets/db70ec28-4db7-4d22-a83f-5ca9e4674888" />
 
+The horizon-level error analysis shows a clear pattern:
 
-- XGBoost: error increases steadily with forecast horizon  
-- Chronos: remains stable across the full 24-hour window  
+- XGBoost error increases as the forecast horizon grows.
+- Chronos remains more stable across the full 24-hour window.
 
-This highlights a structural difference:
-- classical ML → error accumulation  
-- foundation models → sequence-level understanding  
+This points to a structural difference between the approaches. Recursive tree-based models are sensitive to their own previous mistakes, while the foundation model forecasts the sequence more directly.
 
 ---
 
-## 📈 Key Outputs  
+## 📈 Key Outputs
 
-- `master.parquet` — cleaned dataset  
-- `features.parquet` — feature-engineered dataset  
-- `baseline_table.csv` — model benchmarks  
-- `leaderboard.csv` — model comparison  
-- Forecast plots for load and carbon intensity  
+The pipeline produces the following main artifacts:
 
-### 🏆 Multi-Target R² Leaderboard  
+- `master.parquet` — cleaned and merged hourly dataset
+- `features.parquet` — feature-engineered forecasting dataset
+- `baseline_table.csv` — baseline model metrics
+- `leaderboard.csv` — model comparison table
+- forecast plots for load and carbon intensity
+- residual load and carbon intensity analysis
+- uncertainty interval visualizations
+
+### 🏆 Multi-Target R² Leaderboard
+
 <img width="2734" height="2689" alt="r2_leaderboard" src="https://github.com/user-attachments/assets/5b9a323d-4a77-401b-8102-c83d8873ccd1" />
 
-
 ---
 
-### 🔬 Physical Insights & Uncertainty Quantification  
+## 🔬 Physical Insights
 
-Beyond raw predictive accuracy, the pipeline extracts actionable grid physics and bound estimates:
+The project is not only about model accuracy. It also uses the data and forecasts to study how the grid behaves physically.
 
-#### Carbon Intensity vs. Residual Load Dependency  
+### Carbon Intensity and Residual Load
+
 <img width="2434" height="1534" alt="carbon_vs_residual_load" src="https://github.com/user-attachments/assets/fcf51b0e-f701-4c0c-9ba7-07f994ba3f9c" />
 
-*Demonstrating highly linear grid physics: as renewables cover demand (driving residual load down), carbon intensity drops directly along the trendline.*
+Residual load is the part of demand that remains after renewable generation has been accounted for.
 
-#### Temporal Load Shifting Opportunity  
+When residual load is low, renewables are covering more of the system demand. In those periods, carbon intensity tends to drop.
+
+The relationship is strongly visible in the data: as residual load decreases, carbon intensity decreases as well. This gives the model output a physical interpretation, not just a statistical one.
+
+---
+
+### Temporal Load Shifting Opportunity
+
 <img width="3028" height="1384" alt="diurnal_seasonal_carbon_heatmap" src="https://github.com/user-attachments/assets/bea84602-8f3b-4497-980a-0626fdf3290f" />
 
-*Aggregating emissions by month and hour to map exact green windows (e.g., summer midday solar abundance) for intelligent load scheduling.*
+Carbon intensity changes by both hour of day and season.
 
-#### Foundation Model Uncertainty Quantification  
+The heatmap highlights cleaner electricity windows, such as periods with strong solar generation during summer midday hours.
+
+This is useful for carbon-aware scheduling. Flexible electricity use, such as storage charging or energy-intensive processes, can be shifted toward lower-carbon periods when operationally possible.
+
+---
+
+### Foundation Model Uncertainty Quantification
+
 <img width="3034" height="1234" alt="chronos_uncertainty_intervals" src="https://github.com/user-attachments/assets/97f7bdb1-edd8-4441-ac09-ffdbf86f8ff1" />
 
-*Wrapping median point forecasts in empirical 80% prediction intervals to guarantee bounded, safe estimates for grid operators.*
+The Chronos forecasts are extended with empirical 80% prediction intervals.
+
+This gives a range of plausible future values instead of only a single forecast line.
+
+For grid-related applications, this matters because uncertainty affects planning. A forecast is more useful when it also communicates how confident the model is across the prediction horizon.
 
 ---
 
-## 🎯 Purpose  
+## 🎯 Purpose
 
-- Build a full pipeline from raw data to forecasting  
-- Predict both energy demand and grid carbon intensity  
-- Understand how the energy mix affects emissions  
-- Compare classical models with foundation models  
-- Keep everything reproducible and structured  
+This project was designed to connect machine learning with real energy-system behavior.
 
----
+The main objectives are to:
 
-## ⚡ Skills Demonstrated  
-
-- Time-series data processing and pipeline design  
-- Integration of real-world energy and weather datasets  
-- Feature engineering based on physical relationships  
-- Prevention of data leakage in forecasting  
-- Multi-horizon forecasting  
-- Model evaluation and benchmarking  
-
-Additional focus:
-- Energy system understanding (generation mix, residual load)  
-- Linking environmental/process engineering with machine learning  
-- Working with foundation models for time-series forecasting  
+- build a reproducible forecasting pipeline from raw data to evaluation
+- forecast both electricity demand and grid carbon intensity
+- study how the generation mix affects emissions
+- compare classical machine learning with time-series foundation models
+- keep the modeling setup causal and leakage-free
+- extract interpretable physical insights from the results
 
 ---
 
-## 📊 Data Sources  
+## ⚡ Skills Demonstrated
 
-- Open Power System Data (OPSD) — load and generation  
-- SMARD (Bundesnetzagentur) — German grid data  
-- Meteostat — weather data  
+This project demonstrates work across data engineering, forecasting, machine learning, and energy-system analysis.
 
-All data sources are open and properly attributed in the repository.
+Main technical areas:
+
+- time-series data processing
+- multi-source dataset integration
+- weather and power system data alignment
+- physical feature engineering
+- leakage-safe forecasting design
+- recursive multi-step forecasting
+- model benchmarking and evaluation
+- foundation model testing for time-series data
+- uncertainty estimation
+- carbon intensity analysis
+
+Energy and environmental focus:
+
+- German generation mix modeling
+- residual load analysis
+- emissions estimation
+- carbon-aware electricity use
+- linking process/environmental engineering with machine learning
 
 ---
 
-## 🧠 Conclusion  
+## 📊 Data Sources
 
-This project shows a clear result:
+The pipeline uses open data sources:
 
-> Pre-trained time-series foundation models can understand and forecast complex physical systems like power grids without task-specific feature engineering.
+- Open Power System Data — load and generation data
+- SMARD / Bundesnetzagentur — German electricity market and grid data
+- Meteostat — historical weather data
 
-The Chronos model:
-- outperformed a heavily engineered XGBoost pipeline  
-- required no manual feature design  
-- remained stable over long forecast horizons  
+All sources are open and attributed in the repository.
 
-In contrast, classical ML models:
-- depend heavily on feature engineering  
-- struggle with recursive forecasting  
-- accumulate errors over time  
+---
 
-This suggests a shift in approach:
+## 🧠 Conclusion
 
-> Instead of manually encoding domain knowledge into features, foundation models can learn these patterns directly from data.
+The results show that carbon intensity forecasting can be approached as both a machine learning problem and an energy-systems problem.
 
+The engineered XGBoost pipeline provides a strong classical baseline, but its recursive setup leads to increasing error across longer forecast horizons.
+
+Chronos-T5 performs more stably over extended horizons, even without manual feature engineering or fine-tuning on the specific dataset.
+
+This suggests that pre-trained time-series foundation models can capture meaningful structure in complex physical systems such as power grids.
+
+The practical value is clear: better carbon intensity forecasts can support electricity use that is not only demand-aware, but emissions-aware.
+
+By identifying when electricity is likely to be cleaner, this type of pipeline can help guide smarter scheduling, flexible demand, and lower-carbon operation of energy systems.
