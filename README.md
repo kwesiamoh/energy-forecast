@@ -11,6 +11,18 @@ Instead of treating electricity demand as a purely numerical forecasting task, t
 
 This makes the problem more practical: electricity is not equally clean at every hour of the day. A kilowatt-hour consumed during high renewable generation can have a very different emissions impact from one consumed during fossil-heavy periods.
 
+## TL;DR
+
+This project builds an end-to-end forecasting pipeline for the German power grid, predicting both electricity demand and real-time carbon intensity.
+
+It combines open grid data, weather data, physical feature engineering, classical machine learning, and a time-series foundation model to study how well different approaches forecast energy system behavior.
+
+The pipeline estimates residual load, emissions, and carbon intensity, then compares an engineered XGBoost forecasting setup against Amazon Chronos-T5 in zero-shot mode.
+
+The key finding is that XGBoost performs well at short horizons but accumulates error during recursive multi-step forecasting, while Chronos remains more stable over longer forecast windows.
+
+Beyond prediction accuracy, the project also identifies cleaner electricity windows and shows how carbon intensity forecasting can support more emissions-aware energy scheduling.
+
 ---
 
 ## 🔧 Overview
