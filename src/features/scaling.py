@@ -27,36 +27,11 @@ Recommended defaults per task:
   - Features (lags, calendar) → "standard"
 
 ═══════════════════════════════════════════════════════════════════════════════
-BUG FIX — Target / Feature Scaler Leakage in split_and_scale()
+Scaling contract
 ═══════════════════════════════════════════════════════════════════════════════
-SYMPTOM: XGBoost predictions flatlined on the validation and test sets, with
-near-zero RMSE on training data but random-noise-level errors on held-out data.
-
-ROOT CAUSE: The previous split_and_scale() was calling .fit() independently
-on each split inside a local scale_split() helper:
-
-    def scale_split(split):             # ← OLD BUGGY IMPLEMENTATION
-        s = t_scaler.fit_transform(split)   # fit on val, then fit on test
-        s = f_scaler.fit_transform(s)       # same problem for features
-        return s
-
-  This caused three separate problems:
-    1. DATA LEAKAGE: val and test statistics (mean, IQR, min, max) leaked
-       into the fitted scalers, giving those splits access to future
-       information not available at training time.
-    2. INCOMPATIBLE SCALES: each split was scaled with its own parameters,
-       so a load_mw value of 50 000 MW might map to 0.8 in training but 0.3
-       in validation — destroying the physical consistency of the feature space.
-    3. INVERSE-TRANSFORM FAILURE: model predictions in scaled space could not
-       be correctly inverted back to MW because the scaler used at inference
-       time was fit on a different distribution than the training scaler.
-
-FIX:
-  - t_scaler and f_scaler are fitted ONCE on the training split only.
-  - .transform() (not .fit_transform()) is called on val and test.
-  - The scale_split() helper is replaced with an explicit three-call pattern
-    to make the contract obvious to the reader.
-  - An assertion confirms that re-fitting never happens on held-out splits.
+Scalers are fitted once on the training split. Validation and test splits are
+transformed with the same fitted parameters to preserve chronological isolation
+and a consistent feature scale.
 
 Usage example:
     from src.features.scaling import FitScaler
@@ -235,11 +210,19 @@ def split_and_scale(
           feature_scaler     – fitted FitScaler for features
     """
     train_end_ts = pd.Timestamp(train_end, tz="UTC")
-    val_end_ts = pd.Timestamp(val_end,   tz="UTC")
+    val_end_ts = pd.Timestamp(val_end, tz="UTC")
+    train_cutoff = (
+        train_end_ts + pd.Timedelta(days=1)
+        if len(train_end.strip()) == 10 else train_end_ts
+    )
+    val_cutoff = (
+        val_end_ts + pd.Timedelta(days=1)
+        if len(val_end.strip()) == 10 else val_end_ts
+    )
 
-    train = df.loc[:train_end_ts].copy()
-    val = df.loc[train_end_ts:val_end_ts].copy()
-    test = df.loc[val_end_ts:].copy()
+    train = df.loc[df.index < train_cutoff].copy()
+    val = df.loc[(df.index >= train_cutoff) & (df.index < val_cutoff)].copy()
+    test = df.loc[df.index >= val_cutoff].copy()
 
     logger.info(
         "Split sizes — train: %d, val: %d, test: %d rows",
@@ -252,17 +235,7 @@ def split_and_scale(
     t_scaler = FitScaler(method=target_method,  columns=target_cols)
     f_scaler = FitScaler(method=feature_method, columns=feature_cols)
 
-    # ── BUG FIX: fit scalers on TRAINING data only ────────────────────────
-    # Both scalers are fitted once on `train` and then applied via .transform()
-    # to all three splits.  Previously, a local scale_split() helper was calling
-    # .fit_transform() on each split independently, which:
-    #   1. Leaked val/test statistics into the scalers (data leakage).
-    #   2. Produced incompatible scale spaces across splits (each split had
-    #      its own mean/IQR), making features physically meaningless when
-    #      compared across the chronological boundary.
-    #   3. Broke inverse_transform at evaluation time (scaler parameters no
-    #      longer matched the training distribution).
-    # The fix: fit once on train, transform-only on val and test.
+    # Fit once on training data and reuse those parameters for held-out splits.
     t_scaler.fit(train)
     f_scaler.fit(train)
 

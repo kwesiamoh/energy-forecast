@@ -14,14 +14,14 @@ Pipeline steps:
   7. Save feature parquet
 
 ═══════════════════════════════════════════════════════════════════════════════
-BUG FIX — "0 Rows" Training Set (Sparse Feature Drop)
+Sparse feature handling
 ═══════════════════════════════════════════════════════════════════════════════
-SYMPTOM:
+Context:
   split_and_scale calls dropna(how="any") across ALL feature columns.
   Because get_feature_cols() was returning sparse columns like de_wpgt
   (wind peak gust, ~90% NaN) every row had at least one NaN → 0 rows survived.
 
-FIX — get_feature_cols() now:
+get_feature_cols():
   1. Computes the NaN rate of every candidate column.
   2. Excludes any column where NaN rate > NAN_EXCLUSION_THRESHOLD (50%).
   3. Logs a WARNING listing the excluded columns so the user can audit them.
@@ -30,14 +30,14 @@ This means split_and_scale will receive a clean feature matrix where
 dropna(how="any") keeps the vast majority of training rows.
 
 ═══════════════════════════════════════════════════════════════════════════════
-BUG FIX — EDA Correlation Matrix NaN (disjoint time ranges)
+EDA correlation with disjoint time ranges
 ═══════════════════════════════════════════════════════════════════════════════
-SYMPTOM:
+Context:
   df.corr() returns NaN for de_wpgt and de_tsun because the intersection
   of valid target data (ends Oct 2020) and valid sunshine data (starts 2022)
   is empty → Pearson correlation undefined → blank heatmap rows.
 
-FIX — the valid_overlap_corr() helper trims the DataFrame to the time window
+The valid_overlap_corr() helper trims the DataFrame to the time window
 where BOTH the target column and the feature column have sufficient valid
 data.  The notebook cells call this before .corr().
 
@@ -45,7 +45,8 @@ data.  The notebook cells call this before .corr().
 New target: carbon_intensity_g_kwh
 ═══════════════════════════════════════════════════════════════════════════════
 Added to TARGET_COLS so that temporal.py automatically generates lag, rolling,
-and diff features for it.
+and diff features for it.  This supports the thesis's carbon-aware forecasting
+component without requiring any changes to the notebook or model code.
 
 ═══════════════════════════════════════════════════════════════════════════════
 Expanded TARGET_COLS — full renewable mix forecasting
@@ -117,7 +118,8 @@ SMARD_TARGET_COLS = [
 
 # Default target set — OPSD primaries (SMARD-backfilled post-2020) plus the
 # four minor renewable series sourced directly from SMARD (continuous coverage
-# 2015 → present, no backfill gap) plus carbon intensity for the carbon-aware forecasting component.
+# 2015 → present, no backfill gap) plus carbon intensity for the thesis's
+# carbon-aware forecasting component.
 #
 # SMARD columns are used for the minor renewables rather than the OPSD
 # equivalents because the OPSD series go NaN after October 2020, which would
@@ -128,6 +130,7 @@ TARGET_COLS: list[str] = OPSD_TARGET_COLS + [
     "run_of_river_mwh_smard",
     "pumped_storage_gen_mwh_smard",
     "other_renewables_mwh_smard",
+    # Derived thesis target
     "carbon_intensity_g_kwh",
 ]
 
@@ -179,48 +182,15 @@ def build_features(
     logger.info("[3/5] Adding weather-derived features …")
     df = add_weather_features(df)
 
-    # ── Compute carbon_intensity_g_kwh ────────────────────────────────────────
-    # Weighted-average grid carbon intensity using the SMARD generation mix
-    # (always present and current, unlike OPSD which stops Oct 2020).
-    # Formula: Σ(generation_i × emission_factor_i) / Σ(generation_i)
-    # Units:   g CO₂-eq / kWh  (MWh at 1-h resolution ≡ average MW, so
-    #          MWh numerator and MWh denominator cancel correctly).
-    # Emission factors match _EMISSION_FACTORS_G_KWH in smard.py exactly.
-    _CARBON_EF: dict[str, float] = {
-        "lignite_mwh_smard":              1000.0,
-        "hard_coal_mwh_smard":             820.0,
-        "gas_mwh_smard":                   490.0,
-        "other_conventional_mwh_smard":    700.0,   # coal/gas/oil mix proxy
-        "biomass_mwh_smard":               230.0,
-        "solar_mwh_smard":                  40.0,
-        "wind_onshore_mwh_smard":           15.0,
-        "wind_offshore_mwh_smard":          15.0,
-        "run_of_river_mwh_smard":           15.0,
-        "pumped_storage_gen_mwh_smard":     15.0,
-        "nuclear_mwh_smard":                12.0,
-        "other_renewables_mwh_smard":       40.0,
-    }
-    _gen_ef = {col: ef for col, ef in _CARBON_EF.items() if col in df.columns}
-    if _gen_ef:
-        _gen_cols = list(_gen_ef.keys())
-        # no negative generation and prevent NaN propagation
-        _clipped = df[_gen_cols].clip(lower=0).fillna(0)
-        _total = _clipped.sum(axis=1)                  # MWh total this hour
-        _co2 = sum(_clipped[col] * ef for col, ef in _gen_ef.items())
-        # Avoid division by zero when all generation is NaN or zero
-        df["carbon_intensity_g_kwh"] = (
-            _co2.where(_total > 0) / _total.where(_total > 0)
-        ).astype("float32")
-        _valid = df["carbon_intensity_g_kwh"].notna().sum()
-        logger.info(
-            "carbon_intensity_g_kwh computed from %d SMARD columns "
-            "(%d / %d rows valid).",
-            len(_gen_ef), _valid, len(df),
-        )
+    # Carbon intensity is computed once by the SMARD loader. The merge layer
+    # suffixes SMARD columns, so expose that authoritative series as a target.
+    carbon_source = "carbon_intensity_g_kwh_smard"
+    if carbon_source in df.columns:
+        df["carbon_intensity_g_kwh"] = df[carbon_source].astype("float32")
     else:
         logger.warning(
-            "carbon_intensity_g_kwh: no SMARD generation columns found in "
-            "master DataFrame. Column will be all-NaN. "
+            "carbon_intensity_g_kwh: SMARD-derived source column not found. "
+            "Column will be all-NaN. "
             "Ensure Phase 1 (build_master) ran successfully."
         )
         df["carbon_intensity_g_kwh"] = np.nan
@@ -251,7 +221,7 @@ def get_feature_cols(
          SMARD targets (e.g. biomass_mwh_smard_lag24).
       3. Per-station weather columns — composites (de_*) are used instead.
       4. OPSD provenance flags (*_from_smard) — informational, not features.
-      5. BUG FIX: columns with > nan_threshold fraction NaN — these cause
+      5. Columns with > nan_threshold fraction NaN — these cause
          dropna(how="any") in split_and_scale to eliminate all training rows.
          Key example: de_wpgt (wind peak gust) is ~90% NaN and would wipe
          the entire training set if included.
@@ -276,11 +246,8 @@ def get_feature_cols(
     # they are excluded by Rule 1 above.  Rule 2 catches every other _smard
     # overlay column that is not in TARGET_COLS / SMARD_TARGET_COLS.
     #
-    # BUG FIX: use endswith("_smard") instead of "_smard" in c.
-    # The old substring check accidentally matched lag/rolling/diff features
-    # derived from SMARD targets (e.g. "biomass_mwh_smard_lag24"), stripping
-    # the temporal history XGBoost needs to train on minor renewables.
-    # endswith() only excludes the raw overlay columns themselves.
+    # endswith() excludes raw overlay columns while retaining temporal
+    # derivatives such as "biomass_mwh_smard_lag24".
     exclude.update(c for c in df.columns if c.endswith("_smard"))
 
     # Rule 3: per-station weather (only use de_* composites)
@@ -299,7 +266,7 @@ def get_feature_cols(
     # Candidate feature columns after structural exclusions
     candidates = [c for c in df.columns if c not in exclude]
 
-    # Rule 5 (BUG FIX): drop columns that are too sparse.
+    # Rule 5: drop columns that are too sparse.
     # This is the critical gate that prevents dropna(how="any") in
     # split_and_scale from producing a zero-row training set.
     # de_wpgt (wind peak gust) is the primary offender at ~90% NaN.
@@ -332,7 +299,7 @@ def valid_overlap_corr(
     """
     Compute pairwise Pearson correlations on the valid overlapping timeframe.
 
-    BUG FIX: calling df.corr() when feature columns and target columns have
+    Calling df.corr() when feature columns and target columns have
     non-overlapping valid periods produces NaN (Pearson requires at least 2
     shared non-NaN observations).  This helper:
       1. Trims the DataFrame to the time range where BOTH the target column

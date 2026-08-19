@@ -5,25 +5,23 @@ Transforms raw Meteostat weather variables into domain-relevant energy
 features.
 
 ═══════════════════════════════════════════════════════════════════════════════
-BUG FIX — clearsky_index evaluates to exactly 0.00 across all timestamps
+Clear-sky index handling
 ═══════════════════════════════════════════════════════════════════════════════
-SYMPTOM: clearsky_index is 0.0 everywhere, failing to track the solar cycle.
+The clear-sky index must track the solar cycle.
 
-ROOT CAUSE (two compounding issues):
+Relevant data conditions:
   1. de_tsun may be ABSENT from the master DataFrame if meteostat.py dropped
      it due to excessive NaN (the DWD fallback introduced in meteostat.py v2).
-     When de_tsun is None, weather.py used to silently skip the feature —
-     but previously the column WAS present (all-NaN), so the assignment ran
-     and produced 0.0 from NaN arithmetic with clip(0, 1).
+     An absent or all-NaN column cannot produce a meaningful index.
 
-  2. Even when de_tsun IS present, the original code wrote:
+  2. When de_tsun is present, its dtype must permit floating-point division:
          df["clearsky_index"] = (tsun / 60.0).clip(0.0, 1.0)
      If de_tsun happened to be stored as integer minutes (0–60) and was
      inadvertently read back as int dtype after a parquet round-trip,
      Python integer division 0 // 60 == 0 for all values < 60, and even
      values of e.g. 30 (30 minutes of sun) would truncate to 0.
 
-FIX:
+Behavior:
   - Explicitly cast tsun to float64 BEFORE dividing by 60.0.  This guarantees
     floating-point division regardless of the dtype on disk.
   - Guard: only create clearsky_index if de_tsun is present AND has at least
@@ -42,7 +40,7 @@ is now the primary path in add_weather_features():
      This is the correct physical approach: it gives the theoretical clear-sky
      GHI, normalised against installed solar capacity.  NaN during nighttime.
   2. If pvlib is not installed, fall back to the de_tsun/60 proxy (with the
-     dtype-cast fix applied).
+     explicit dtype cast applied).
 
 Moving this here rather than keeping it notebook-only ensures the feature is
 always present in features.parquet and is available to Phase 3+ models without

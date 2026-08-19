@@ -14,20 +14,20 @@ All lags are computed PER TARGET COLUMN so you control exactly which
 series get which features.
 
 ═══════════════════════════════════════════════════════════════════════════════
-BUG FIX — Catastrophic target leakage in rolling and diff features
+Leakage-safe temporal features
 ═══════════════════════════════════════════════════════════════════════════════
-SYMPTOM: add_rolling_features and add_diff_features were computing statistics
+Temporal features must avoid computing statistics
 that included the current timestep t, meaning the model could indirectly see
 y[t] while predicting y[t].
 
-ROOT CAUSE:
+Implementation considerations:
   - add_diff_features used df[col].diff(d) directly, which computes
     y[t] − y[t-d].  For d=1 this means the feature at time t is
     y[t] − y[t-1], which requires knowing y[t].
   - add_rolling_features needed an explicit .shift(1) before .rolling()
     to guarantee the window closes at t-1, not t.
 
-FIX (applied in this version):
+Implementation:
   - add_diff_features now computes:   series.shift(1).diff(d)
     → feature at t  =  y[t-1] − y[t-1-d]   (strictly backward-looking)
   - add_rolling_features: .shift(1) is applied to the raw series BEFORE
@@ -156,10 +156,10 @@ def add_diff_features(
     Append first-difference features (velocity / rate-of-change).
 
     LEAKAGE FIX — leakage-free diffs via shift(1):
-      ORIGINAL (BUGGY):
+      Unsafe form:
         df[col].diff(d)          → y[t] − y[t-d]  ← requires knowing y[t]!
 
-      FIXED:
+      Used form:
         df[col].shift(1).diff(d) → y[t-1] − y[t-1-d]  ← strictly causal
 
       The fixed version captures the same velocity signal but computed one
@@ -223,7 +223,8 @@ def add_all_temporal_features(
         df with all temporal features appended.
     """
     if targets is None:
-        # Include all available target candidates, including full SMARD mix and the carbon intensity target added.
+        # Include all available target candidates, including full SMARD mix
+        # and the carbon intensity target added for the thesis.
         # The four SMARD minor-renewable series are added here to match the
         # expanded TARGET_COLS in pipeline.py — temporal features are generated
         # for them automatically without requiring any notebook changes.
@@ -238,6 +239,7 @@ def add_all_temporal_features(
             # Remaining SMARD generation mix (for full-mix modelling)
             "biomass_mw", "run_of_river_mw", "nuclear_mw",
             "lignite_mw", "hard_coal_mw", "gas_mw",
+            # Derived thesis target
             "carbon_intensity_g_kwh",
         ]
         targets = [c for c in candidates if c in df.columns]
