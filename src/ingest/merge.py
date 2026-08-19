@@ -12,8 +12,7 @@ opsd.py   → pure OPSD download + parse (no backfill logic)
 smard.py  → pure SMARD download + parse
 merge.py  → owns ALL cross-source logic, including the OPSD ← SMARD backfill
 
-The SMARD backfill was previously split between opsd.py and merge.py.  It now
-lives entirely here so that opsd.py remains a clean single-responsibility
+The SMARD backfill lives entirely here so that opsd.py remains a single-responsibility
 loader.
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -22,7 +21,7 @@ OPSD stale data (target columns 100% NaN from Oct 2020 onward)
 OPSD stopped being updated in October 2020.  After that date load_mw,
 solar_mw, wind_onshore_mw and wind_offshore_mw from OPSD are all NaN.
 
-Fix: after the standard left-join, a backfill pass maps the corresponding
+After the standard left-join, a backfill pass maps the corresponding
 SMARD columns (which are current through today) into the OPSD target columns
 for any hour where OPSD is missing.
 

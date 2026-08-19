@@ -16,10 +16,10 @@ via the Meteostat Python library (v2.x).
 Composite national features are computed as population-weighted means
 across stations using approximate Voronoi area weights.
 
-BUG FIX (v2) — de_tsun NaN 2018-2022:
+Sunshine coverage:
   Meteostat bulk CSVs for many German stations are missing sunshine (tsun)
   data before mid-2022.  This module implements a two-stage fallback:
-    1. Try Meteostat (existing logic, unchanged).
+    1. Try Meteostat.
     2. For any station where tsun is >80% NaN, attempt to backfill from the
        DWD (Deutscher Wetterdienst) Open Data API — specifically the
        "stundenwerte_SD" (hourly sunshine duration) dataset.
