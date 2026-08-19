@@ -14,8 +14,8 @@ Contract
   predict(df, horizon)
       Return a 2-D numpy array of shape (len(df), horizon).
       df is the feature DataFrame at the forecast origin points.
-      Each row i is a forecast issued at df.index[i], covering steps
-      i+1, i+2, …, i+horizon into the future.
+      Each row i is the first timestamp being forecast. Column 0 predicts
+      df.index[i], and later columns predict subsequent timestamps.
 
   save(path) / load(path)
       Serialise and restore model state. Subclasses override these.
@@ -31,8 +31,8 @@ Design notes
   - predict() receives the FEATURE DataFrame, not raw targets. The model
     is responsible for selecting which columns it uses internally.
   - Multi-step forecasting strategy is up to the subclass:
-      * Direct:    train one model per horizon step (XGBoost default)
-      * Recursive: feed prediction back as a lag (ARIMA default)
+      * Direct:    train one model per horizon step
+      * Recursive: feed prediction back as a lag (XGBoost and ARIMA)
       * Seq2Seq:   encoder-decoder (foundation models)
   - All models must be able to re-fit incrementally via fit() with new
     data (for the continual learning loop in Phase 5).
@@ -45,10 +45,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .metrics import MetricResult, all_metrics
-
-logger = logging.getLogger(__name__)
-
+from .metrics import MetricResult
 
 class BaseForecaster(ABC):
     """Abstract base class for all energy forecasting models."""
@@ -110,8 +107,7 @@ class BaseForecaster(ABC):
         """
         Run predict(), align with actuals, compute all metrics.
 
-        For multi-step evaluation we report the *average* error across
-        all horizon steps (standard practice for comparative baselines).
+        The scalar summary compares horizon 1 with the value at each row.
         Per-step breakdown is available via metrics.eval_by_horizon().
 
         Args:
@@ -147,8 +143,7 @@ class BaseForecaster(ABC):
 
         actuals = df[self.target_col].values          # (N,)
 
-        # For multi-step: compare h=1 predictions against actuals
-        # (the most common single-number summary for baseline tables)
+        # Horizon column 0 predicts the target at the corresponding row.
         y_pred_h1 = preds[:, 0] if preds.ndim == 2 else preds
 
         result = MetricResult.from_arrays(

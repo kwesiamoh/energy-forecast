@@ -47,16 +47,16 @@ You can experiment with 336 (2 weeks) or 720 (30 days) if GPU memory
 allows, but diminishing returns beyond 168h for most energy targets.
 
 ═══════════════════════════════════════════════════════════════════════════════
-BUG FIX — Sequence Contiguity (non-contiguous DatetimeIndex)
+Sequence contiguity
 ═══════════════════════════════════════════════════════════════════════════════
-SYMPTOM:
+Context:
   The feature pipeline drops rows with missing exogenous features, leaving gaps
   in the DatetimeIndex passed to fit().  _make_sliding_windows maps array
   position directly to time step, so a gap of N hours would be silently treated
   as N consecutive 1-hour steps, misaligning every subsequent context/forecast
   pair and corrupting the temporal patterns learned during fine-tuning.
 
-FIX:
+Handling:
   fit() now reindexes train_df and val_df onto a contiguous pd.date_range at
   "h" frequency before extracting the target series.  Gap positions become NaN.
   _make_sliding_windows already skips any window whose forecast target contains
@@ -71,7 +71,6 @@ ChronosPipeline.predict(). This is orders of magnitude faster than
 looping row-by-row and is the correct way to use the Chronos API.
 """
 
-import logging
 import pickle
 from pathlib import Path
 
@@ -80,8 +79,6 @@ import pandas as pd
 import torch
 
 from .base import BaseForecaster
-
-logger = logging.getLogger(__name__)
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 

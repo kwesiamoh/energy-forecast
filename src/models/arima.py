@@ -40,15 +40,15 @@ Limitations (document honestly for README)
 Dependencies: pmdarima (pip install pmdarima), statsmodels
 
 ═══════════════════════════════════════════════════════════════════════════════
-BUG FIX — Sequence Contiguity (non-contiguous DatetimeIndex)
+Sequence contiguity
 ═══════════════════════════════════════════════════════════════════════════════
-SYMPTOM:
+Context:
   The feature pipeline drops rows that have missing exogenous features, leaving
   gaps in the DatetimeIndex passed to fit().  SARIMAX interprets consecutive
   index positions as consecutive time steps, so a 2-hour gap is silently treated
   as two 1-hour steps — corrupting the seasonal structure (s=24).
 
-FIX:
+Handling:
   _extract_series(reindex=True) rebuilds a contiguous pd.date_range at "h"
   frequency spanning [index.min(), index.max()] and reindexes the target
   series onto it before passing it to SARIMAX.  The resulting NaN values
@@ -56,7 +56,6 @@ FIX:
   (enforce_stationarity=False, enforce_invertibility=False).
 """
 
-import logging
 import pickle
 from pathlib import Path
 
@@ -64,8 +63,6 @@ import numpy as np
 import pandas as pd
 
 from .base import BaseForecaster
-
-logger = logging.getLogger(__name__)
 
 # Default SARIMA order (used if auto_arima is disabled or unavailable)
 DEFAULT_ORDER         = (2, 1, 2)
@@ -107,7 +104,6 @@ class SARIMAForecaster(BaseForecaster):
         self._model       = None   # fitted ARIMAResults or SARIMAX object
         self._order       = DEFAULT_ORDER
         self._seasonal_order = DEFAULT_SEASONAL_ORDER if seasonal else (0, 0, 0, 0)
-        self._train_series: pd.Series | None = None
 
     # ── fit ───────────────────────────────────────────────────────────────
 
@@ -117,8 +113,6 @@ class SARIMAForecaster(BaseForecaster):
         val_df: pd.DataFrame | None = None,
     ) -> "SARIMAForecaster":
         series = self._extract_series(train_df, reindex=True)
-        self._train_series = series
-
         if self.auto_order:
             self._order, self._seasonal_order = self._find_order(series)
 
@@ -198,42 +192,18 @@ class SARIMAForecaster(BaseForecaster):
         """
         Generate horizon-step forecasts for each row of df.
 
-        Strategy: apply_model() on the new observations up to each origin,
-        then forecast H steps ahead. For large df this is slow — consider
-        batching or using predict_in_sample() for the training period.
-
-        For the test set we iterate row-by-row (expensive but correct).
-        For a faster approximate version, use predict_rolling() below.
+        Uses rolling-origin evaluation: forecast before observing each row,
+        then append that observation to the state used by the next origin.
 
         Returns:
             Array of shape (len(df), self.horizon).
         """
-        if not self.is_fitted:
-            raise RuntimeError("Model not fitted.")
-
-        series = self._extract_series(df)
-        preds = np.full((len(df), self.horizon), np.nan)
-
-        # Use SARIMAX.apply() to update the model state with new observations
-        # then call forecast(). This is the statistically correct approach.
-        updated = self._model.apply(series.values)
-
-        for i in range(len(df)):
-            try:
-                fc = updated.forecast(steps=self.horizon)
-                preds[i] = fc.values
-            except Exception as e:
-                self._logger.debug("Forecast failed at step %d: %s", i, e)
-
-        return preds
+        return self.predict_rolling(df)
 
     def predict_rolling(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Faster approximate rolling forecast using in-sample predictions
-        extended with recursive out-of-sample steps.
-
-        Use this for quick evaluation during development. Use predict() for
-        final benchmark numbers.
+        Rolling-origin forecast that assimilates each actual observation only
+        after issuing the forecast for that timestamp.
         """
         if not self.is_fitted:
             raise RuntimeError("Model not fitted.")
@@ -242,16 +212,17 @@ class SARIMAForecaster(BaseForecaster):
         n = len(series)
         preds = np.full((n, self.horizon), np.nan)
 
-        # In-sample one-step predictions
-        insample = self._model.predict(start=0, end=len(self._train_series) - 1)
-
-        # Out-of-sample
-        try:
-            forecast_all = self._model.forecast(steps=n + self.horizon)
-            for i in range(n):
-                preds[i] = forecast_all.values[i: i + self.horizon]
-        except Exception as e:
-            self._logger.warning("Rolling forecast failed: %s", e)
+        updated = self._model
+        for i in range(n):
+            try:
+                preds[i] = np.asarray(
+                    updated.forecast(steps=self.horizon), dtype=float
+                )
+                updated = updated.append(series.iloc[[i]], refit=False)
+            except Exception as e:
+                self._logger.warning(
+                    "Rolling forecast failed at origin %d: %s", i, e
+                )
 
         return preds
 

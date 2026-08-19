@@ -30,7 +30,7 @@ import pandas as pd
 from src.features.pipeline import TARGET_COLS, build_features, get_feature_cols
 from src.features.scaling import split_and_scale
 from src.models.arima import SARIMAForecaster
-from src.models.metrics import MetricResult, ResultsRegistry, eval_by_horizon
+from src.models.metrics import MetricResult, ResultsRegistry
 from src.models.xgboost_model import XGBoostForecaster
 
 warnings.filterwarnings("ignore")

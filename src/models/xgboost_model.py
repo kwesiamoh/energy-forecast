@@ -1,32 +1,54 @@
 """
-XGBoost multi-output direct forecasting model.
+XGBoost recursive one-step forecaster.
 
 XGBoost is the strongest classical baseline for energy forecasting. Unlike
 ARIMA it consumes ALL features — calendar, weather, lags — which typically
 gives it a 20–40% MAE advantage over univariate methods.
 
-Forecasting strategy: DIRECT multi-output
-──────────────────────────────────────────
-  We train H independent XGBoost regressors, one per horizon step h=1…H.
-  This is the "direct" strategy:
+Forecasting strategy: RECURSIVE (single model, iterative rollout)
+──────────────────────────────────────────────────────────────────
+  We train one XGBoost regressor that predicts the target at t from the
+  leakage-safe feature state at t:
 
-    model_h(X_t) → ŷ_{t+h}   for h = 1, 2, …, H
+    model(X_t) → ŷ_{t+1}
 
-  Advantages over recursive:
-  - No error accumulation (each model is independently optimal for its step)
-  - Parallelisable (train all H models simultaneously)
-  - Feature set can differ per step (though we use the same here)
+  To produce an H-step forecast, we roll the model forward, updating the
+  relevant lag and rolling-window features at each step so that the next
+  call to model() sees the freshly predicted value as part of its history:
 
-  Disadvantage: H × model storage (mitigated by XGBoost's small tree sizes).
+    for h = 1 … H:
+        ŷ_{t+h} = model(X_{t+h})
+        update lag / rolling features        # inject ŷ into feature state
+        X_{t+h} ← updated features          # feed forward
+
+  Why recursive instead of direct?
+  ─────────────────────────────────────────────────────────
+  The direct strategy trains H independent models (one per horizon step).
+  For h > 6 the training labels are so far into the future that the models
+  degrade to the mean, producing a characteristic flatline.  A single h=1
+  model is trained on the densest possible signal and stays sharp across
+  all steps.
+
+  Trade-off: recursive accumulates prediction errors over the rollout.
+  For 24-hour energy horizons this is generally a smaller problem than the
+  mean-regression artefact it replaces.
 
 Feature handling
 ────────────────
   - Accepts any numeric columns from the Phase 2 feature DataFrame.
-  - Target-column lags (load_mw_lag24 etc.) are the most important features.
+  - Target-column lags (load_mw_lag1, load_mw_lag24, etc.) and rolling
+    windows (load_mw_roll24_mean, etc.) are the most important features.
   - NaN rows are dropped before fitting (lag warmup period).
-  - At prediction time, NaN features cause XGBoost to use its built-in
-    missing-value handling (follows the optimal split direction learned
-    during training).
+  - At each recursive step only the recognised lag/rolling features for the
+    target column are mutated; all other features (weather, calendar, …) are
+    left untouched.
+
+Quantile forecasts
+──────────────────
+  Quantile estimation via recursive point-forecasting requires residual
+  bootstrapping (sample from the h=1 residual distribution and propagate
+  through the rollout).  This is non-trivial and is not implemented here.
+  predict_quantiles() raises NotImplementedError with guidance.
 
 Hyperparameter tuning
 ─────────────────────
@@ -37,17 +59,16 @@ Hyperparameter tuning
 Dependencies: xgboost, optuna (optional, for HPO), joblib
 """
 
-import logging
 import pickle
+import re
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 
 from .base import BaseForecaster
-
-logger = logging.getLogger(__name__)
 
 # Competitive defaults for hourly energy forecasting (no tuning required)
 DEFAULT_PARAMS = {
@@ -65,16 +86,35 @@ DEFAULT_PARAMS = {
     "verbosity":        0,
 }
 
+# ---------------------------------------------------------------------------
+# Regex patterns for lag and rolling features we will update during rollout.
+# These patterns match the naming convention produced by Phase 2 engineering:
+#
+#   {target}_lag{N}              e.g. load_mw_lag1, load_mw_lag24
+#   {target}_roll{N}_{stat}      e.g. load_mw_roll24_mean, load_mw_roll48_std
+#   {target}_diff{N}             e.g. load_mw_diff1
+#
+# Only features matching these templates for the *target column* are mutated;
+# all other features remain frozen at their original values.
+# ---------------------------------------------------------------------------
+_LAG_RE    = re.compile(r"^(.+)_lag(\d+)$")
+_ROLL_RE   = re.compile(r"^(.+)_roll(\d+)_(\w+)$")
+_DIFF_RE   = re.compile(r"^(.+)_diff(\d+)$")
+
 
 class XGBoostForecaster(BaseForecaster):
     """
-    Direct multi-step XGBoost forecaster.
+    Recursive single-step XGBoost forecaster.
+
+    A single XGBoost model predicts the target at the current forecast row.
+    Later horizons are produced by rolling it forward and injecting its output
+    into the lag/rolling features at each step.
 
     Args:
         target_col:    Column to forecast.
-        horizon:       Forecast horizon in hours (one model per step).
+        horizon:       Forecast horizon in hours.
         feature_cols:  Explicit list of feature columns. If None, all numeric
-                       columns except target and SMARD overlays are used.
+                       columns except target and raw SMARD overlays are used.
         params:        XGBoost hyperparameters (merged with DEFAULT_PARAMS).
         early_stopping_rounds:
                        Stop training if val loss doesn't improve for N rounds.
@@ -87,79 +127,67 @@ class XGBoostForecaster(BaseForecaster):
         self,
         target_col: str = "load_mw",
         horizon: int = 24,
-        feature_cols: list[str] | None = None,
-        params: dict | None = None,
-        early_stopping_rounds: int | None = 30,
+        feature_cols: Optional[list] = None,
+        params: Optional[dict] = None,
+        early_stopping_rounds: Optional[int] = 30,
     ):
         super().__init__(target_col=target_col, horizon=horizon)
-        self.feature_cols           = feature_cols
-        self.params                 = {**DEFAULT_PARAMS, **(params or {})}
-        self.early_stopping_rounds  = early_stopping_rounds
-        self._models: list[xgb.XGBRegressor] = []  # one per horizon step
-        self._feature_cols_fitted: list[str] = []
+        self.feature_cols            = feature_cols
+        self.params                  = {**DEFAULT_PARAMS, **(params or {})}
+        self.early_stopping_rounds   = early_stopping_rounds
+        self._model: Optional[xgb.XGBRegressor] = None   # single h=1 model
+        self._feature_cols_fitted: list = []
 
     # ── fit ───────────────────────────────────────────────────────────────
 
     def fit(
         self,
         train_df: pd.DataFrame,
-        val_df: pd.DataFrame | None = None,
+        val_df: Optional[pd.DataFrame] = None,
     ) -> "XGBoostForecaster":
         """
-        Train H XGBoost regressors (one per horizon step).
+        Train one XGBoost regressor to predict the target at each feature row.
 
-        For step h, the label is the target value h rows ahead:
-            y_h[i] = target[i + h]
+        Label:  y[i] = target[i]
+        Features: all resolved feature columns at time i.
 
-        This means the training set shrinks by h rows at the end for each
-        model — a small cost for correct direct forecasting.
+        The single model is stored in self._model.
         """
         feat_cols = self._resolve_features(train_df)
         self._feature_cols_fitted = feat_cols
-        self._models = []
 
         X_train = train_df[feat_cols]
-        y_train_base = train_df[self.target_col]
+        y_train = train_df[self.target_col]
 
-        X_val = val_df[feat_cols] if val_df is not None else None
-        y_val_base = val_df[self.target_col] if val_df is not None else None
+        # Drop rows where any feature or the label is NaN (lag warm-up rows)
+        mask_train = X_train.notna().all(axis=1) & y_train.notna()
+        X_tr = X_train[mask_train].values
+        y_tr = y_train[mask_train].values
 
         self._logger.info(
-            "Fitting %d XGBoost models for '%s' (H=1…%d) on %d rows, %d features …",
-            self.horizon, self.target_col, self.horizon, len(X_train), len(feat_cols),
+            "Fitting single XGBoost h=1 model for '%s' on %d rows, %d features …",
+            self.target_col, len(X_tr), len(feat_cols),
         )
 
-        for h in range(1, self.horizon + 1):
-            # Shift target h steps into the future relative to features
-            y_h = y_train_base.shift(-h)
+        fit_kwargs: dict = {}
+        if val_df is not None and self.early_stopping_rounds:
+            X_val = val_df[feat_cols]
+            y_val = val_df[self.target_col]
+            mask_val = X_val.notna().all(axis=1) & y_val.notna()
+            X_v = X_val[mask_val].values
+            y_v = y_val[mask_val].values
+            fit_kwargs["eval_set"] = [(X_v, y_v)]
+            fit_kwargs["verbose"] = False
 
-            # Align: drop rows where y or any feature is NaN
-            mask_train = X_train.notna().all(axis=1) & y_h.notna()
-            X_h = X_train[mask_train].values
-            y_h = y_h[mask_train].values
-
-            fit_kwargs: dict = {}
-            if X_val is not None and y_val_base is not None and self.early_stopping_rounds:
-                y_val_h = y_val_base.shift(-h)
-                mask_val = X_val.notna().all(axis=1) & y_val_h.notna()
-                X_val_h = X_val[mask_val].values
-                y_val_h = y_val_base.shift(-h)[mask_val].values
-                fit_kwargs["eval_set"] = [(X_val_h, y_val_h)]
-                fit_kwargs["verbose"] = False
-
-            model = xgb.XGBRegressor(
-                **self.params,
-                early_stopping_rounds=self.early_stopping_rounds if X_val is not None else None,
-            )
-            model.fit(X_h, y_h, **fit_kwargs)
-            self._models.append(model)
-
-            if h % 6 == 0 or h == self.horizon:
-                self._logger.info("  … h=%d/%d fitted", h, self.horizon)
+        self._model = xgb.XGBRegressor(
+            **self.params,
+            early_stopping_rounds=self.early_stopping_rounds if val_df is not None else None,
+        )
+        self._model.fit(X_tr, y_tr, **fit_kwargs)
 
         self.is_fitted = True
         self._logger.info(
-            "XGBoost fitting complete. Feature importances available via .feature_importance()"
+            "XGBoost h=1 model fitted. Feature importances available via .feature_importance()"
         )
         return self
 
@@ -167,19 +195,76 @@ class XGBoostForecaster(BaseForecaster):
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Generate H-step forecasts for each row of df.
+        Generate H-step forecasts for each row of df via recursive rollout.
+
+        Algorithm
+        ─────────
+        For each row i in df we maintain a *feature state* vector.  At step h:
+
+          1. Predict ŷ_{t+h} = model(state)
+          2. Store ŷ_{t+h} in the output array.
+          3. Update the lag / rolling / diff features in *state* so that the
+             model will see ŷ_{t+h} as recent history on the next step.
+
+        The update step is performed in-place on a plain NumPy array (indexed
+        by pre-computed column positions) to avoid any pandas fragmentation
+        or SettingWithCopyWarning issues inside the loop.
 
         Returns:
-            Array of shape (len(df), self.horizon).
+            Array of shape (len(df), self.horizon) — one row per input row,
+            one column per horizon step.
         """
         if not self.is_fitted:
-            raise RuntimeError("Model not fitted.")
+            raise RuntimeError("Model is not fitted yet. Call .fit() first.")
 
-        X = df[self._feature_cols_fitted].values
-        preds = np.full((len(df), self.horizon), np.nan, dtype=np.float32)
+        feat_cols = self._feature_cols_fitted
+        col_index = {col: i for i, col in enumerate(feat_cols)}
 
-        for h, model in enumerate(self._models):
-            preds[:, h] = model.predict(X)
+        # Pre-compute which (column_index, lag_offset) pairs to update for
+        # lag features, rolling features, and diff features of the target.
+        lag_updates  = self._build_lag_update_plan(feat_cols, col_index)
+        roll_updates = self._build_roll_update_plan(feat_cols, col_index)
+        diff_updates = self._build_diff_update_plan(feat_cols, col_index)
+        calendar_indices = self._calendar_feature_indices(feat_cols)
+
+        # Work on a float32 copy — one row per sample, shape (N, F)
+        # Using a separate array per sample avoids cross-row contamination.
+        X_init = df[feat_cols].values.astype(np.float32)          # (N, F)
+
+        N = len(df)
+        H = self.horizon
+        preds = np.full((N, H), np.nan, dtype=np.float32)
+
+        for i in range(N):
+            # Independent feature state for sample i; we will mutate this
+            # in-place across the H rollout steps.
+            state = X_init[i].copy()                               # (F,)
+
+            # history_window: a rolling buffer of the last max_lag actual /
+            # predicted target values so we can recompute rolling stats.
+            # Populated from the lag features found in the initial state.
+            history = self._extract_history_from_state(
+                state, lag_updates, roll_updates, diff_updates
+            )
+
+            for h in range(H):
+                # Calendar fields are deterministic and known in advance.
+                # Unknown future weather and other exogenous values persist.
+                future_row = i + h
+                if h > 0 and future_row < N:
+                    state[calendar_indices] = X_init[future_row, calendar_indices]
+
+                # ── Step A: predict this horizon timestamp ─────────────────
+                y_hat = float(self._model.predict(state.reshape(1, -1))[0])
+
+                # ── Step B: store prediction ───────────────────────────────
+                preds[i, h] = y_hat
+
+                # ── Step C: update feature state ───────────────────────────
+                self._update_state(
+                    state, y_hat, history,
+                    lag_updates, roll_updates, diff_updates,
+                )
 
         return preds
 
@@ -187,15 +272,13 @@ class XGBoostForecaster(BaseForecaster):
 
     def feature_importance(
         self,
-        horizon_step: int = 1,
         importance_type: str = "gain",
         top_n: int = 30,
     ) -> pd.Series:
         """
-        Return feature importances for a given horizon step.
+        Return feature importances for the single h=1 model.
 
         Args:
-            horizon_step:    1-indexed step (1 = next hour, 24 = 24h ahead).
             importance_type: "gain", "weight", or "cover".
             top_n:           Return only the top N features.
 
@@ -203,11 +286,36 @@ class XGBoostForecaster(BaseForecaster):
             pd.Series indexed by feature name, sorted descending.
         """
         if not self.is_fitted:
-            raise RuntimeError("Model not fitted.")
-        model = self._models[horizon_step - 1]
-        scores = model.get_booster().get_score(importance_type=importance_type)
-        series = pd.Series(scores, index=list(scores.keys())).sort_values(ascending=False)
+            raise RuntimeError("Model is not fitted yet. Call .fit() first.")
+        scores = self._model.get_booster().get_score(importance_type=importance_type)
+        series = pd.Series(scores).sort_values(ascending=False)
         return series.head(top_n)
+
+    # ── quantile forecasts ────────────────────────────────────────────────
+
+    def predict_quantiles(self, df: pd.DataFrame, quantiles: list) -> np.ndarray:
+        """
+        Not implemented for the recursive strategy.
+
+        Quantile estimation via recursive rollout requires propagating
+        uncertainty through each step — typically done via residual
+        bootstrapping:
+
+          1. Fit the h=1 model and collect its in-sample residuals.
+          2. At inference time, for each bootstrap draw b:
+               - Sample residuals ε_1 … ε_H (with replacement).
+               - Roll out: ŷ_{t+h}^b = model(state) + ε_h, update state.
+          3. Compute empirical quantiles across B draws.
+
+        This is deferred to a future implementation.  Use predict() for
+        point forecasts in the meantime.
+        """
+        raise NotImplementedError(
+            "predict_quantiles() is not yet supported for the recursive "
+            "XGBoost strategy.  Quantile intervals require residual "
+            "bootstrapping across the rollout horizon — see the docstring "
+            "for the recommended approach."
+        )
 
     # ── HPO ───────────────────────────────────────────────────────────────
 
@@ -216,19 +324,16 @@ class XGBoostForecaster(BaseForecaster):
         train_df: pd.DataFrame,
         val_df: pd.DataFrame,
         n_trials: int = 50,
-        horizon_step: int = 1,
     ) -> dict:
         """
-        Run Optuna HPO to find better hyperparameters.
+        Run Optuna HPO to find better hyperparameters for the h=1 model.
 
-        Optimises only for horizon_step=1 (good proxy for all steps).
         Updates self.params with the best found parameters.
 
         Args:
-            train_df:    Training DataFrame.
-            val_df:      Validation DataFrame (objective metric evaluated here).
-            n_trials:    Number of Optuna trials.
-            horizon_step: Horizon step to optimise for.
+            train_df:  Training DataFrame.
+            val_df:    Validation DataFrame (objective metric evaluated here).
+            n_trials:  Number of Optuna trials.
 
         Returns:
             Best hyperparameter dict.
@@ -240,13 +345,14 @@ class XGBoostForecaster(BaseForecaster):
             raise ImportError("Install optuna: pip install optuna")
 
         feat_cols = self._resolve_features(train_df)
+
         X_train = train_df[feat_cols]
-        y_train = train_df[self.target_col].shift(-horizon_step)
+        y_train = train_df[self.target_col]
         mask = X_train.notna().all(axis=1) & y_train.notna()
         X_tr, y_tr = X_train[mask].values, y_train[mask].values
 
         X_val = val_df[feat_cols]
-        y_val = val_df[self.target_col].shift(-horizon_step)
+        y_val = val_df[self.target_col]
         mask_v = X_val.notna().all(axis=1) & y_val.notna()
         X_v, y_v = X_val[mask_v].values, y_val[mask_v].values
 
@@ -274,31 +380,31 @@ class XGBoostForecaster(BaseForecaster):
 
         best = study.best_params
         self.params = {**DEFAULT_PARAMS, **best}
-        self._logger.info("Optuna HPO complete. Best MAE=%.2f. Params: %s", study.best_value, best)
+        self._logger.info(
+            "Optuna HPO complete. Best MAE=%.2f. Params: %s", study.best_value, best
+        )
         return self.params
 
     # ── persistence ───────────────────────────────────────────────────────
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         state = {
-            "target_col":           self.target_col,
-            "horizon":              self.horizon,
-            "params":               self.params,
-            "feature_cols":         self._feature_cols_fitted,
+            "target_col":            self.target_col,
+            "horizon":               self.horizon,
+            "params":                self.params,
+            "feature_cols":          self._feature_cols_fitted,
             "early_stopping_rounds": self.early_stopping_rounds,
         }
-        # Save state dict
         with open(path.with_suffix(".meta.pkl"), "wb") as f:
             pickle.dump(state, f)
-        # Save each XGB model separately (supports JSON serialisation)
-        for h, model in enumerate(self._models):
-            model.save_model(str(path.with_suffix(f".h{h+1:03d}.ubj")))
-        self._logger.info("XGBoost saved → %s (.meta.pkl + %d model files)", path, len(self._models))
+        # Single model — save as universal binary JSON
+        self._model.save_model(str(path.with_suffix(".model.ubj")))
+        self._logger.info("XGBoost saved → %s (.meta.pkl + .model.ubj)", path)
 
     @classmethod
-    def load(cls, path: str | Path) -> "XGBoostForecaster":
+    def load(cls, path) -> "XGBoostForecaster":
         path = Path(path)
         with open(path.with_suffix(".meta.pkl"), "rb") as f:
             state = pickle.load(f)
@@ -310,47 +416,180 @@ class XGBoostForecaster(BaseForecaster):
             early_stopping_rounds=state["early_stopping_rounds"],
         )
         instance._feature_cols_fitted = state["feature_cols"]
-        instance._models = []
-        for h in range(instance.horizon):
-            model = xgb.XGBRegressor()
-            model.load_model(str(path.with_suffix(f".h{h+1:03d}.ubj")))
-            instance._models.append(model)
+        instance._model = xgb.XGBRegressor()
+        instance._model.load_model(str(path.with_suffix(".model.ubj")))
         instance.is_fitted = True
         return instance
 
-    # ── internal ──────────────────────────────────────────────────────────
+    # ── internal: feature resolution ──────────────────────────────────────
 
-    def _resolve_features(self, df: pd.DataFrame) -> list[str]:
-        """Return feature columns, excluding target and non-numeric cols.
-
-        Exclusion rules:
-          - The target column itself.
-          - Raw SMARD overlay columns (e.g. ``load_mwh_smard``) — these are
-            the direct API series used for backfilling and must not be used
-            as features because they are available at training time but not
-            at inference time.  We match *only* columns whose name ends with
-            ``_smard`` so that temporal derivatives of SMARD-sourced targets
-            (e.g. ``biomass_mwh_smard_lag24``, ``biomass_mwh_smard_roll24_mean``)
-            are retained as valid, causally-safe features.
-          - Per-city weather station columns (redundant with national
-            composites and high in cardinality).
-        """
+    def _resolve_features(self, df: pd.DataFrame) -> list:
+        """Return the explicit or canonical pipeline feature columns."""
         if self.feature_cols is not None:
             return [c for c in self.feature_cols if c in df.columns]
 
-        exclude = {self.target_col}
-        # BUG FIX: use endswith("_smard") instead of "_smard" in c.
-        # The old substring check accidentally stripped lag/rolling/diff
-        # features derived from SMARD renewable targets (e.g.
-        # "biomass_mwh_smard_lag24"), starving XGBoost of their history.
-        # endswith() targets only the raw overlay columns themselves.
-        exclude.update(c for c in df.columns if c.endswith("_smard"))
-        exclude.update(c for c in df.columns if c.startswith((
-            "berlin_", "frankfurt_", "munich_", "hamburg_", "stuttgart_"
-        )))
+        from src.features.pipeline import get_feature_cols
 
-        return [
-            c for c in df.columns
-            if c not in exclude
-            and pd.api.types.is_numeric_dtype(df[c])
-        ]
+        return get_feature_cols(df)
+
+    # ── internal: recursive rollout helpers ───────────────────────────────
+
+    def _build_lag_update_plan(
+        self,
+        feat_cols: list,
+        col_index: dict,
+    ) -> list:
+        """
+        Return a sorted list of (col_idx, lag_int) for all lag features of
+        the target column, sorted by lag ascending (lag1 first).
+
+        Example entry: (3, 1) means feat_cols[3] is '{target}_lag1'.
+        """
+        plan = []
+        for col in feat_cols:
+            m = _LAG_RE.match(col)
+            if m and m.group(1) == self.target_col:
+                lag = int(m.group(2))
+                plan.append((col_index[col], lag))
+        # Ascending lag order so we can shift them correctly
+        plan.sort(key=lambda x: x[1])
+        return plan
+
+    def _build_roll_update_plan(
+        self,
+        feat_cols: list,
+        col_index: dict,
+    ) -> list:
+        """
+        Return a list of (col_idx, window_int, stat_str) for all rolling
+        features of the target column.
+
+        We need the window size so we know how many history values to average.
+        Supported stats: mean, std, min, max, median.
+        """
+        plan = []
+        for col in feat_cols:
+            m = _ROLL_RE.match(col)
+            if m and m.group(1) == self.target_col:
+                window = int(m.group(2))
+                stat   = m.group(3)
+                plan.append((col_index[col], window, stat))
+        return plan
+
+    def _build_diff_update_plan(
+        self,
+        feat_cols: list,
+        col_index: dict,
+    ) -> list:
+        """
+        Return a list of (col_idx, diff_order) for all diff features of the
+        target column.
+
+        Example: '{target}_diff1' → difference between current and lag-1.
+        """
+        plan = []
+        for col in feat_cols:
+            m = _DIFF_RE.match(col)
+            if m and m.group(1) == self.target_col:
+                order = int(m.group(2))
+                plan.append((col_index[col], order))
+        return plan
+
+    def _extract_history_from_state(
+        self,
+        state: np.ndarray,
+        lag_updates: list,
+        roll_updates: list,
+        diff_updates: list,
+    ) -> list:
+        """
+        Reconstruct an ordered history buffer from the initial lag features.
+
+        The buffer is a Python list where index 0 is the *most recent* known
+        value (lag1), index 1 is lag2, etc.  We fill as many slots as the
+        maximum lag / window we need to update.
+
+        Values not covered by any lag feature are left as NaN.
+        """
+        if not lag_updates and not roll_updates:
+            return []
+
+        max_needed = 0
+        if lag_updates:
+            max_needed = max(max_needed, lag_updates[-1][1])   # already sorted
+        if roll_updates:
+            max_needed = max(max_needed, max(w for _, w, _ in roll_updates))
+        if diff_updates:
+            max_needed = max(max_needed, max(o for _, o in diff_updates))
+
+        history = [np.nan] * max_needed
+        for col_idx, lag in lag_updates:
+            if lag <= max_needed:
+                history[lag - 1] = float(state[col_idx])
+        return history
+
+    @staticmethod
+    def _calendar_feature_indices(feat_cols: list[str]) -> np.ndarray:
+        """Return positions of deterministic calendar features."""
+        calendar_cols = {
+            "hour", "dow", "month", "quarter", "week_of_year",
+            "day_of_year", "year", "hour_sin", "hour_cos", "dow_sin",
+            "dow_cos", "month_sin", "month_cos", "doy_sin", "doy_cos",
+            "is_weekend", "is_night", "is_peak_morning", "is_peak_evening",
+            "is_holiday", "is_holiday_eve", "season",
+        }
+        return np.asarray(
+            [i for i, col in enumerate(feat_cols) if col in calendar_cols],
+            dtype=np.intp,
+        )
+
+    def _update_state(
+        self,
+        state: np.ndarray,
+        y_hat: float,
+        history: list,
+        lag_updates: list,
+        roll_updates: list,
+        diff_updates: list,
+    ) -> None:
+        """
+        Mutate *state* in-place to reflect that y_hat is the newest value.
+
+        History is also updated in-place: y_hat is prepended (shift right),
+        so history[0] always holds the most recent value.
+
+        All writes go directly to the NumPy array via integer indices —
+        no pandas involved, so no fragmentation or copy warnings.
+        """
+        # ── Diff features (need previous value before we shift history) ──
+        for col_idx, order in diff_updates:
+            if order <= len(history):
+                prev = history[order - 1]
+                state[col_idx] = np.nan if np.isnan(prev) else y_hat - prev
+
+        # ── Shift history buffer: y_hat becomes the new lag-1 ────────────
+        history.insert(0, y_hat)    # O(N) but history is short (≤ 168)
+        # Trim to avoid unbounded growth (keep only what we actually need)
+        # The maximum window / lag is fixed; cap at len to save memory.
+        # We do NOT pop here so history grows by exactly 1 per step and
+        # naturally covers increasing lags as the rollout extends.
+
+        # ── Lag features ─────────────────────────────────────────────────
+        for col_idx, lag in lag_updates:
+            if lag <= len(history):
+                state[col_idx] = history[lag - 1]
+
+        # ── Rolling features ─────────────────────────────────────────────
+        _STAT_FNS = {
+            "mean":   np.nanmean,
+            "std":    np.nanstd,
+            "min":    np.nanmin,
+            "max":    np.nanmax,
+            "median": np.nanmedian,
+        }
+        for col_idx, window, stat in roll_updates:
+            window_vals = [v for v in history[:window] if not np.isnan(v)]
+            if window_vals:
+                fn = _STAT_FNS.get(stat, np.nanmean)
+                state[col_idx] = fn(window_vals)
+            # If all NaN, leave the existing value unchanged (best we can do)
