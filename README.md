@@ -302,14 +302,10 @@ All sources are open and attributed in the repository.
 
 ## 🧠 Conclusion
 
-The results show that carbon intensity forecasting can be approached as both a machine learning problem and an energy-systems problem.
+This project showed that forecasting carbon intensity requires more than treating the problem as a standard time-series task. The behavior of the grid is closely tied to demand, renewable generation, residual load, weather conditions, and the changing generation mix.
 
-The engineered XGBoost pipeline provides a strong classical baseline, but its recursive setup leads to increasing error across longer forecast horizons.
+XGBoost worked well as a classical baseline, especially over shorter horizons. However, because the model uses recursive forecasting, errors from earlier predictions are carried forward and become more noticeable as the horizon increases.
 
-Chronos-T5 performs more stably over extended horizons, even without manual feature engineering or fine-tuning on the specific dataset.
+Chronos-T5 was more stable over longer forecast windows, despite being used in zero-shot mode and without the engineered weather, calendar, and lag features used by XGBoost. This made the comparison particularly useful: the two models approached the same forecasting problem in very different ways.
 
-This suggests that pre-trained time-series foundation models can capture meaningful structure in complex physical systems such as power grids.
-
-The practical value is clear: better carbon intensity forecasts can support electricity use that is not only demand-aware, but emissions-aware.
-
-By identifying when electricity is likely to be cleaner, this type of pipeline can help guide smarter scheduling, flexible demand, and lower-carbon operation of energy systems.
+Beyond model performance, the analysis also showed why carbon intensity forecasting can be useful in practice. Since the carbon content of electricity changes throughout the day, forecasts can help identify periods when flexible electricity demand could be shifted toward lower-carbon hours.
