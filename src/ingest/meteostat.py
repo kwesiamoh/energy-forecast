@@ -4,14 +4,9 @@ Meteostat weather ingestion module.
 Downloads hourly weather observations for 20 representative German stations
 via the Meteostat Python library (v2.x).
 
-⚠️  REQUIRES meteostat >= 2.0.0
-    The library's API changed completely in v2.0.0 (released Dec 30, 2025).
-    The old `from meteostat import Hourly; Hourly(id, start, end).fetch()` API
-    was removed.  The new API is:
+Requires meteostat >= 2.0.0:
         import meteostat as ms
         ms.hourly(ms.Station(id='10382'), start, end).fetch()
-    The legacy bulk.meteostat.net endpoint was also deprecated Jan 2026.
-    Install/upgrade with: pip install "meteostat>=2.0.0"
 
 Composite national features are computed as population-weighted means
 across stations using approximate Voronoi area weights.
@@ -83,7 +78,7 @@ STATIONS = [
     ("10410", "02564", "Dresden",       51.11, 13.76, 12_900),
     ("10501", "00691", "Bremen",        53.05,  8.80,  8_400),
     ("10513", "01981", "Hamburg",       53.63,  9.99, 14_200),
-    ("10338", "01757", "Hannover",      52.47,  9.69, 20_100),  # EDDV — WMO 10338 (was wrong 10601)
+    ("10338", "01757", "Hannover",      52.47,  9.69, 20_100),  # EDDV — WMO 10338
     ("10637", "03032", "Kassel",        51.30,  9.45, 16_700),
     ("10708", "05705", "Cologne",       50.87,  6.10, 13_400),
     ("10724", "01327", "Dortmund",      51.52,  7.60,  9_800),
@@ -96,13 +91,11 @@ STATIONS = [
     ("10929", "01001", "Zugspitze",     47.42, 10.98,  4_100),  # Alpine
     ("10200", "00044", "Flensburg",     54.77,  9.38,  6_300),
     ("10147", "03378", "Rostock",       54.18, 12.08, 13_100),
-    ("10554", "03931", "Erfurt",        50.98, 10.96, 11_200),  # EDDE — WMO 10554 (was wrong 10338)
+    ("10554", "03931", "Erfurt",        50.98, 10.96, 11_200),  # EDDE — WMO 10554
     ("10727", "04371", "Muenster",      51.95,  7.60, 10_800),
 ]
 
-# Meteostat columns we care about — v2 API column names.
-# v1.x had "wpgt" (wind gust peak); v2 removed it from default hourly output.
-# "wdir" (wind direction) and "cldc" (cloud cover %) are new in v2.
+# Meteostat hourly columns used by the feature pipeline.
 METEOSTAT_COLS = ["temp", "rhum", "prcp", "wspd", "wdir", "pres", "tsun", "cldc"]
 
 # DWD Open Data base URL for hourly sunshine
@@ -216,10 +209,7 @@ def _load_station_meteostat(
         from meteostat import Hourly
         Hourly('10382', start, end).fetch()
 
-    The legacy bulk.meteostat.net endpoint was deprecated Jan 2026.
-    v2 uses data.meteostat.net instead and is preferred.
-
-    To upgrade:  pip install --upgrade meteostat
+    The v2 data endpoint is preferred; v1 support remains best-effort.
     """
     import traceback  # noqa: PLC0415
     import meteostat as ms  # noqa: PLC0415
@@ -240,8 +230,8 @@ def _load_station_meteostat(
             # ── v1 API ────────────────────────────────────────────────────
             logger.warning(
                 "meteostat v%d.%d detected (< 2.0). "
-                "The v1 bulk endpoint is deprecated (Jan 2026) and may return "
-                "empty data. Upgrade with: pip install --upgrade meteostat",
+                "Its bulk endpoint may return empty data; meteostat >= 2.0 "
+                "is required for the supported endpoint.",
                 major, minor,
             )
             from meteostat import Hourly  # noqa: PLC0415
@@ -424,6 +414,7 @@ def load_meteostat(
 
     station_frames: list[pd.DataFrame] = []
     station_names:  list[str]          = []
+    station_weights: list[float]       = []
 
     for (met_id, dwd_id, name, lat, lon, _), w in zip(STATIONS, norm_weights):
         slug = name.lower().replace("ü", "ue").replace("ö", "oe")
@@ -436,7 +427,7 @@ def load_meteostat(
 
         # Attempt DWD sunshine backfill if the module flag permits it.
         # This is controlled by the module-level DROP_TSUN_IF_SPARSE global,
-        # NOT by a function argument (removed to simplify the public API).
+        # controlled by the module-level DROP_TSUN_IF_SPARSE setting.
         if not DROP_TSUN_IF_SPARSE:
             sdf = _backfill_tsun_dwd(sdf, dwd_id, start_ts, end_ts)
         else:
@@ -446,6 +437,7 @@ def load_meteostat(
 
         station_frames.append(sdf)
         station_names.append(slug)
+        station_weights.append(w)
 
     if not station_frames:
         try:
@@ -453,8 +445,7 @@ def load_meteostat(
             version_info = f"meteostat v{major}.{minor} is installed"
             if major < 2:
                 version_info += (
-                    " — this is the OLD v1 API whose bulk endpoint was "
-                    "deprecated Jan 2026. Upgrade: pip install --upgrade meteostat"
+                    " — versions below 2.0 use an unsupported bulk endpoint"
                 )
         except ImportError:
             version_info = "meteostat is NOT installed. Install: pip install meteostat"
@@ -464,7 +455,7 @@ def load_meteostat(
         )
 
     # Build national composites
-    composite = _build_composite(station_frames, norm_weights[:len(station_frames)], full_index)
+    composite = _build_composite(station_frames, station_weights, full_index)
 
     # Build per-station DataFrame (only for stations we loaded)
     per_station_parts = []

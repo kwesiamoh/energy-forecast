@@ -153,6 +153,7 @@ class BaseForecaster(ABC):
             horizon=self.horizon,
             y_true=actuals,
             y_pred=y_pred_h1,
+            evaluated_step=1,
         )
         self._logger.info(str(result))
         return result

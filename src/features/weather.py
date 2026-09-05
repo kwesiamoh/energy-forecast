@@ -11,15 +11,12 @@ The clear-sky index must track the solar cycle.
 
 Relevant data conditions:
   1. de_tsun may be ABSENT from the master DataFrame if meteostat.py dropped
-     it due to excessive NaN (the DWD fallback introduced in meteostat.py v2).
+     it due to excessive missingness in the source data.
      An absent or all-NaN column cannot produce a meaningful index.
 
   2. When de_tsun is present, its dtype must permit floating-point division:
          df["clearsky_index"] = (tsun / 60.0).clip(0.0, 1.0)
-     If de_tsun happened to be stored as integer minutes (0–60) and was
-     inadvertently read back as int dtype after a parquet round-trip,
-     Python integer division 0 // 60 == 0 for all values < 60, and even
-     values of e.g. 30 (30 minutes of sun) would truncate to 0.
+     The calculation casts it to floating point before division.
 
 Behavior:
   - Explicitly cast tsun to float64 BEFORE dividing by 60.0.  This guarantees
@@ -30,11 +27,10 @@ Behavior:
     variance (daytime hours should be > 0 wherever sun shines).
 
 ═══════════════════════════════════════════════════════════════════════════════
-Promoted: pvlib Ineichen clearsky model (preferred over de_tsun proxy)
+pvlib Ineichen clearsky model
 ═══════════════════════════════════════════════════════════════════════════════
-The Phase 1 notebook computed a more physically rigorous clearsky_index using
-pvlib's Ineichen model at Germany's geographic centroid. That implementation
-is now the primary path in add_weather_features():
+add_weather_features() uses pvlib's Ineichen model at Germany's geographic
+centroid when pvlib is available:
 
   1. If pvlib is installed, compute clearsky_index via the Ineichen model.
      This is the correct physical approach: it gives the theoretical clear-sky
@@ -42,9 +38,7 @@ is now the primary path in add_weather_features():
   2. If pvlib is not installed, fall back to the de_tsun/60 proxy (with the
      explicit dtype cast applied).
 
-Moving this here rather than keeping it notebook-only ensures the feature is
-always present in features.parquet and is available to Phase 3+ models without
-requiring notebook re-runs or manual DataFrame patching.
+The diagnostic is generated consistently through the feature pipeline.
 
 Features produced
 ─────────────────

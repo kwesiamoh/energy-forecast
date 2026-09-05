@@ -16,43 +16,31 @@ Pipeline steps:
 ═══════════════════════════════════════════════════════════════════════════════
 Sparse feature handling
 ═══════════════════════════════════════════════════════════════════════════════
-Context:
-  split_and_scale calls dropna(how="any") across ALL feature columns.
-  Because get_feature_cols() was returning sparse columns like de_wpgt
-  (wind peak gust, ~90% NaN) every row had at least one NaN → 0 rows survived.
-
 get_feature_cols():
-  1. Computes the NaN rate of every candidate column.
+  1. Computes the NaN rate of every candidate column in the training period.
   2. Excludes any column where NaN rate > NAN_EXCLUSION_THRESHOLD (50%).
   3. Logs a WARNING listing the excluded columns so the user can audit them.
 
-This means split_and_scale will receive a clean feature matrix where
-dropna(how="any") keeps the vast majority of training rows.
+This prevents sparse sensors such as de_wpgt from entering model feature sets
+without adequate training-period coverage.
 
 ═══════════════════════════════════════════════════════════════════════════════
 EDA correlation with disjoint time ranges
 ═══════════════════════════════════════════════════════════════════════════════
-Context:
-  df.corr() returns NaN for de_wpgt and de_tsun because the intersection
-  of valid target data (ends Oct 2020) and valid sunshine data (starts 2022)
-  is empty → Pearson correlation undefined → blank heatmap rows.
-
 The valid_overlap_corr() helper trims the DataFrame to the time window
 where BOTH the target column and the feature column have sufficient valid
 data.  The notebook cells call this before .corr().
 
 ═══════════════════════════════════════════════════════════════════════════════
-New target: carbon_intensity_g_kwh
+Carbon-intensity target
 ═══════════════════════════════════════════════════════════════════════════════
-Added to TARGET_COLS so that temporal.py automatically generates lag, rolling,
-and diff features for it.  This supports the thesis's carbon-aware forecasting
-component without requiring any changes to the notebook or model code.
+TARGET_COLS includes carbon_intensity_g_kwh, so temporal.py generates its lag,
+rolling, and difference features.
 
 ═══════════════════════════════════════════════════════════════════════════════
-Expanded TARGET_COLS — full renewable mix forecasting
+Renewable-mix targets
 ═══════════════════════════════════════════════════════════════════════════════
-Four additional SMARD series have been added to TARGET_COLS to support
-forecasting the complete renewable generation mix:
+Four SMARD series in TARGET_COLS support renewable generation-mix forecasting:
 
   biomass_mwh_smard             – biomass generation (continuous SMARD series)
   run_of_river_mwh_smard        – run-of-river hydro
@@ -70,6 +58,7 @@ diff features for every column in TARGET_COLS, so no changes to temporal.py
 are required.
 """
 
+import json
 import logging
 from pathlib import Path
 
@@ -81,6 +70,9 @@ from .temporal import add_all_temporal_features
 from .weather import add_weather_features
 
 logger = logging.getLogger(__name__)
+
+FEATURE_CACHE_VERSION = 2
+DEFAULT_TRAIN_END = "2021-12-31"
 
 # ── Column definitions ────────────────────────────────────────────────────────
 
@@ -97,7 +89,7 @@ SMARD_TARGET_COLS = [
     # Raw SMARD generation columns (suffixed by merge.py's smard_overlay step).
     # ⚠ Keep this list in sync with SMARD_FILTERS in smard.py.
     # oil_mwh, total_*, renewable_share, carbon_intensity_g_kwh are NOT fetched
-    # by smard.py (removed in the filter-ID audit) and must not appear here.
+    # by smard.py and must not appear here.
     "load_mwh_smard",
     "residual_load_mwh_smard",
     "pumped_storage_cons_mwh_smard",
@@ -118,8 +110,8 @@ SMARD_TARGET_COLS = [
 
 # Default target set — OPSD primaries (SMARD-backfilled post-2020) plus the
 # four minor renewable series sourced directly from SMARD (continuous coverage
-# 2015 → present, no backfill gap) plus carbon intensity for the thesis's
-# carbon-aware forecasting component.
+# 2015 → present, no backfill gap) plus carbon intensity for carbon-aware
+# forecasting experiments.
 #
 # SMARD columns are used for the minor renewables rather than the OPSD
 # equivalents because the OPSD series go NaN after October 2020, which would
@@ -130,15 +122,24 @@ TARGET_COLS: list[str] = OPSD_TARGET_COLS + [
     "run_of_river_mwh_smard",
     "pumped_storage_gen_mwh_smard",
     "other_renewables_mwh_smard",
-    # Derived thesis target
+    # Derived carbon-aware forecasting target
     "carbon_intensity_g_kwh",
 ]
 
 # ── Sparse-feature exclusion threshold ───────────────────────────────────────
 # Columns with more than this fraction of NaN are excluded from the feature
-# matrix returned by get_feature_cols().  This prevents the dropna(how="any")
-# in split_and_scale from wiping out all training rows.
+# matrix returned by get_feature_cols().
 NAN_EXCLUSION_THRESHOLD: float = 0.50
+
+# Regional OPSD series are retained for diagnostics but excluded from model
+# features because they do not provide consistent forecast-period coverage.
+REGIONAL_OPSD_PREFIXES: tuple[str, ...] = (
+    "50hertz_",
+    "amprion_",
+    "lu_",
+    "tennet_",
+    "transnetbw_",
+)
 
 
 # ── Main pipeline function ────────────────────────────────────────────────────
@@ -162,12 +163,26 @@ def build_features(
     """
     processed_dir = Path(processed_dir)
     cache = processed_dir / "features.parquet"
+    cache_meta = processed_dir / "features.meta.json"
+    master_path = processed_dir / "master.parquet"
+    requested_targets = TARGET_COLS if lag_targets is None else lag_targets
+    cache_spec = {
+        "version": FEATURE_CACHE_VERSION,
+        "lag_targets": requested_targets,
+        "master_mtime_ns": master_path.stat().st_mtime_ns if master_path.exists() else None,
+    }
 
-    if cache.exists() and not force:
+    cache_valid = False
+    if cache.exists() and cache_meta.exists() and not force:
+        try:
+            cache_valid = json.loads(cache_meta.read_text()) == cache_spec
+        except (OSError, ValueError):
+            cache_valid = False
+
+    if cache_valid:
         logger.info("Loading cached feature parquet from %s", cache)
         return pd.read_parquet(cache)
 
-    master_path = processed_dir / "master.parquet"
     if not master_path.exists():
         raise FileNotFoundError(
             f"master.parquet not found at {master_path}. Run Phase 1 first."
@@ -196,13 +211,14 @@ def build_features(
         df["carbon_intensity_g_kwh"] = np.nan
 
     logger.info("[4/5] Adding temporal features …")
-    targets = lag_targets or TARGET_COLS
+    targets = requested_targets
     df = add_all_temporal_features(df, targets=targets)
 
     logger.info("[5/5] Validating feature DataFrame …")
     _validate(df)
 
     df.to_parquet(cache)
+    cache_meta.write_text(json.dumps(cache_spec, indent=2))
     logger.info("Feature parquet saved → %s  (shape: %s)", cache, df.shape)
     return df
 
@@ -210,6 +226,7 @@ def build_features(
 def get_feature_cols(
     df: pd.DataFrame,
     nan_threshold: float = NAN_EXCLUSION_THRESHOLD,
+    train_end: str = DEFAULT_TRAIN_END,
 ) -> list[str]:
     """
     Return the list of columns to use as MODEL INPUTS.
@@ -220,12 +237,11 @@ def get_feature_cols(
          Uses endswith() to preserve lag/rolling/diff features derived from
          SMARD targets (e.g. biomass_mwh_smard_lag24).
       3. Per-station weather columns — composites (de_*) are used instead.
-      4. OPSD provenance flags (*_from_smard) — informational, not features.
-      5. Columns with > nan_threshold fraction NaN — these cause
-         dropna(how="any") in split_and_scale to eliminate all training rows.
-         Key example: de_wpgt (wind peak gust) is ~90% NaN and would wipe
-         the entire training set if included.
-         Excluded columns are logged as WARNINGs for the user to audit.
+      4. Regional OPSD columns — retained for diagnostics, not model inputs.
+      5. OPSD provenance flags (*_from_smard) — informational, not features.
+      6. Columns with > nan_threshold fraction NaN — insufficient training
+         coverage for use as model inputs. Excluded columns are logged as
+         WARNINGs for the user to audit.
 
     Args:
         df:            Feature DataFrame (output of build_features).
@@ -260,17 +276,40 @@ def get_feature_cols(
     for slug in _station_slugs:
         exclude.update(c for c in df.columns if c.startswith(f"{slug}_"))
 
-    # Rule 4: provenance flags
+    # Rule 4: regional OPSD series retained only for diagnostics and EDA
+    exclude.update(
+        c for c in df.columns
+        if c.startswith(REGIONAL_OPSD_PREFIXES)
+    )
+
+    # Rule 5: provenance flags
     exclude.update(c for c in df.columns if c.endswith("_from_smard"))
+
+    # Realized same-hour aggregate wind generation is retained for diagnostics
+    # and electricity-system characterization, but is not forecast-safe input.
+    exclude.add("wind_mw")
+
+    # This diagnostic uses observed solar generation and is retained for EDA,
+    # but it is not available as an operational forecasting covariate.
+    exclude.add("clearsky_index")
 
     # Candidate feature columns after structural exclusions
     candidates = [c for c in df.columns if c not in exclude]
 
-    # Rule 5: drop columns that are too sparse.
-    # This is the critical gate that prevents dropna(how="any") in
-    # split_and_scale from producing a zero-row training set.
+    # Rule 6: drop columns that are too sparse for model use.
     # de_wpgt (wind peak gust) is the primary offender at ~90% NaN.
-    nan_rates = df[candidates].isna().mean()
+    train_end_ts = pd.Timestamp(train_end)
+    if len(train_end.strip()) == 10:
+        train_end_ts += pd.Timedelta(days=1)
+    if isinstance(df.index, pd.DatetimeIndex) and df.index.tz is not None:
+        if train_end_ts.tzinfo is None:
+            train_end_ts = train_end_ts.tz_localize(df.index.tz)
+        else:
+            train_end_ts = train_end_ts.tz_convert(df.index.tz)
+    selection_df = df.loc[df.index < train_end_ts]
+    if selection_df.empty:
+        raise ValueError("No rows fall inside the feature-selection training period.")
+    nan_rates = selection_df[candidates].isna().mean()
     too_sparse = nan_rates[nan_rates > nan_threshold].index.tolist()
     not_sparse = nan_rates[nan_rates <= nan_threshold].index.tolist()
 

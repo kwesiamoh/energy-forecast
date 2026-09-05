@@ -1,16 +1,15 @@
 """
 XGBoost recursive one-step forecaster.
 
-XGBoost is the strongest classical baseline for energy forecasting. Unlike
-ARIMA it consumes ALL features — calendar, weather, lags — which typically
-gives it a 20–40% MAE advantage over univariate methods.
+Unlike ARIMA, XGBoost consumes target-specific temporal features together
+with shared calendar and weather features.
 
 Forecasting strategy: RECURSIVE (single model, iterative rollout)
 ──────────────────────────────────────────────────────────────────
   We train one XGBoost regressor that predicts the target at t from the
   leakage-safe feature state at t:
 
-    model(X_t) → ŷ_{t+1}
+    model(X_t) → ŷ_t
 
   To produce an H-step forecast, we roll the model forward, updating the
   relevant lag and rolling-window features at each step so that the next
@@ -21,17 +20,7 @@ Forecasting strategy: RECURSIVE (single model, iterative rollout)
         update lag / rolling features        # inject ŷ into feature state
         X_{t+h} ← updated features          # feed forward
 
-  Why recursive instead of direct?
-  ─────────────────────────────────────────────────────────
-  The direct strategy trains H independent models (one per horizon step).
-  For h > 6 the training labels are so far into the future that the models
-  degrade to the mean, producing a characteristic flatline.  A single h=1
-  model is trained on the densest possible signal and stays sharp across
-  all steps.
-
-  Trade-off: recursive accumulates prediction errors over the rollout.
-  For 24-hour energy horizons this is generally a smaller problem than the
-  mean-regression artefact it replaces.
+  Recursive rollout can accumulate prediction errors as the horizon grows.
 
 Feature handling
 ────────────────
@@ -39,9 +28,10 @@ Feature handling
   - Target-column lags (load_mw_lag1, load_mw_lag24, etc.) and rolling
     windows (load_mw_roll24_mean, etc.) are the most important features.
   - NaN rows are dropped before fitting (lag warmup period).
-  - At each recursive step only the recognised lag/rolling features for the
-    target column are mutated; all other features (weather, calendar, …) are
-    left untouched.
+  - At each recursive step, temporal features for the modeled target are
+    recomputed from consecutive history. Calendar fields advance using the
+    input timeline. Weather observed at the origin is a nowcast and persists
+    across the future rollout because no weather-forecast subsystem is used.
 
 Quantile forecasts
 ──────────────────
@@ -240,16 +230,14 @@ class XGBoostForecaster(BaseForecaster):
             # in-place across the H rollout steps.
             state = X_init[i].copy()                               # (F,)
 
-            # history_window: a rolling buffer of the last max_lag actual /
-            # predicted target values so we can recompute rolling stats.
-            # Populated from the lag features found in the initial state.
-            history = self._extract_history_from_state(
-                state, lag_updates, roll_updates, diff_updates
+            # Consecutive actual history before this forecast origin.
+            history = self._extract_history_from_frame(
+                df, i, lag_updates, roll_updates, diff_updates
             )
 
             for h in range(H):
                 # Calendar fields are deterministic and known in advance.
-                # Unknown future weather and other exogenous values persist.
+                # Origin weather acts as a nowcast and persists into the future.
                 future_row = i + h
                 if h > 0 and future_row < N:
                     state[calendar_indices] = X_init[future_row, calendar_indices]
@@ -261,6 +249,10 @@ class XGBoostForecaster(BaseForecaster):
                 preds[i, h] = y_hat
 
                 # ── Step C: update feature state ───────────────────────────
+                if h + 1 == H:
+                    continue
+                if history is None:
+                    break
                 self._update_state(
                     state, y_hat, history,
                     lag_updates, roll_updates, diff_updates,
@@ -424,13 +416,24 @@ class XGBoostForecaster(BaseForecaster):
     # ── internal: feature resolution ──────────────────────────────────────
 
     def _resolve_features(self, df: pd.DataFrame) -> list:
-        """Return the explicit or canonical pipeline feature columns."""
+        """Return features usable by a target-specific recursive model."""
         if self.feature_cols is not None:
-            return [c for c in self.feature_cols if c in df.columns]
+            features = [c for c in self.feature_cols if c in df.columns]
+        else:
+            from src.features.pipeline import get_feature_cols
+            features = get_feature_cols(df)
 
-        from src.features.pipeline import get_feature_cols
-
-        return get_feature_cols(df)
+        from src.features.pipeline import TARGET_COLS
+        other_targets = [target for target in TARGET_COLS if target != self.target_col]
+        temporal_suffixes = ("_lag", "_roll", "_diff")
+        return [
+            col for col in features
+            if not any(
+                col.startswith(f"{target}{suffix}")
+                for target in other_targets
+                for suffix in temporal_suffixes
+            )
+        ]
 
     # ── internal: recursive rollout helpers ───────────────────────────────
 
@@ -465,7 +468,7 @@ class XGBoostForecaster(BaseForecaster):
         features of the target column.
 
         We need the window size so we know how many history values to average.
-        Supported stats: mean, std, min, max, median.
+        Supported stats: mean and std.
         """
         plan = []
         for col in feat_cols:
@@ -485,7 +488,7 @@ class XGBoostForecaster(BaseForecaster):
         Return a list of (col_idx, diff_order) for all diff features of the
         target column.
 
-        Example: '{target}_diff1' → difference between current and lag-1.
+        Example: '{target}_diff1' → y[t-1] minus y[t-2].
         """
         plan = []
         for col in feat_cols:
@@ -495,23 +498,22 @@ class XGBoostForecaster(BaseForecaster):
                 plan.append((col_index[col], order))
         return plan
 
-    def _extract_history_from_state(
+    def _extract_history_from_frame(
         self,
-        state: np.ndarray,
+        df: pd.DataFrame,
+        origin: int,
         lag_updates: list,
         roll_updates: list,
         diff_updates: list,
-    ) -> list:
+    ) -> list | None:
         """
-        Reconstruct an ordered history buffer from the initial lag features.
+        Return the complete consecutive history before one forecast origin.
 
         The buffer is a Python list where index 0 is the *most recent* known
-        value (lag1), index 1 is lag2, etc.  We fill as many slots as the
-        maximum lag / window we need to update.
-
-        Values not covered by any lag feature are left as NaN.
+        value (lag1), index 1 is lag2, and so on. Missing observations remain
+        NaN at their physical hourly positions.
         """
-        if not lag_updates and not roll_updates:
+        if not lag_updates and not roll_updates and not diff_updates:
             return []
 
         max_needed = 0
@@ -522,11 +524,23 @@ class XGBoostForecaster(BaseForecaster):
         if diff_updates:
             max_needed = max(max_needed, max(o for _, o in diff_updates))
 
-        history = [np.nan] * max_needed
-        for col_idx, lag in lag_updates:
-            if lag <= max_needed:
-                history[lag - 1] = float(state[col_idx])
-        return history
+        if isinstance(df.index, pd.DatetimeIndex):
+            origin_ts = df.index[origin]
+            history_index = pd.date_range(
+                end=origin_ts - pd.Timedelta(hours=1),
+                periods=max_needed,
+                freq="h",
+            )
+            if history_index[0] < df.index.min():
+                return None
+            values = df[self.target_col].reindex(history_index).to_numpy(dtype=float)
+        else:
+            if origin < max_needed:
+                return None
+            values = df[self.target_col].iloc[origin - max_needed:origin].to_numpy(
+                dtype=float
+            )
+        return values[::-1].tolist()
 
     @staticmethod
     def _calendar_feature_indices(feat_cols: list[str]) -> np.ndarray:
@@ -569,10 +583,7 @@ class XGBoostForecaster(BaseForecaster):
 
         # ── Shift history buffer: y_hat becomes the new lag-1 ────────────
         history.insert(0, y_hat)    # O(N) but history is short (≤ 168)
-        # Trim to avoid unbounded growth (keep only what we actually need)
-        # The maximum window / lag is fixed; cap at len to save memory.
-        # We do NOT pop here so history grows by exactly 1 per step and
-        # naturally covers increasing lags as the rollout extends.
+        del history[-1]
 
         # ── Lag features ─────────────────────────────────────────────────
         for col_idx, lag in lag_updates:
@@ -580,16 +591,15 @@ class XGBoostForecaster(BaseForecaster):
                 state[col_idx] = history[lag - 1]
 
         # ── Rolling features ─────────────────────────────────────────────
-        _STAT_FNS = {
-            "mean":   np.nanmean,
-            "std":    np.nanstd,
-            "min":    np.nanmin,
-            "max":    np.nanmax,
-            "median": np.nanmedian,
-        }
         for col_idx, window, stat in roll_updates:
-            window_vals = [v for v in history[:window] if not np.isnan(v)]
-            if window_vals:
-                fn = _STAT_FNS.get(stat, np.nanmean)
-                state[col_idx] = fn(window_vals)
-            # If all NaN, leave the existing value unchanged (best we can do)
+            window_vals = np.asarray(history[:window], dtype=float)
+            valid = window_vals[np.isfinite(window_vals)]
+            min_periods = max(1, int(window * 0.5))
+            if len(valid) < min_periods:
+                state[col_idx] = np.nan
+            elif stat == "mean":
+                state[col_idx] = float(np.mean(valid))
+            elif stat == "std":
+                state[col_idx] = (
+                    float(np.std(valid, ddof=1)) if len(valid) > 1 else np.nan
+                )

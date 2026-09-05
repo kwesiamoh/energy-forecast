@@ -1,7 +1,7 @@
 """
 Baseline evaluation harness.
 
-Runs SARIMA and XGBoost against all four targets, collects metrics into
+Runs SARIMA and XGBoost against the configured targets, collects metrics into
 a ResultsRegistry, and produces publication-ready comparison tables and
 plots. This is the script you run to generate the benchmark numbers that
 all future Phase 4 (foundation) models must beat.
@@ -30,7 +30,12 @@ import pandas as pd
 from src.features.pipeline import TARGET_COLS, build_features, get_feature_cols
 from src.features.scaling import split_and_scale
 from src.models.arima import SARIMAForecaster
-from src.models.metrics import MetricResult, ResultsRegistry
+from src.models.metrics import (
+    MetricResult,
+    ResultsRegistry,
+    eval_by_horizon,
+    get_target_unit,
+)
 from src.models.xgboost_model import XGBoostForecaster
 
 warnings.filterwarnings("ignore")
@@ -88,7 +93,7 @@ def run_baseline_evaluation(
     # ── 1. Load features ─────────────────────────────────────────────────
     logger.info("Loading feature dataset …")
     df = build_features(processed_dir)
-    feat_cols = get_feature_cols(df)
+    feat_cols = get_feature_cols(df, train_end=train_end)
 
     splits = split_and_scale(
         df,
@@ -108,7 +113,7 @@ def run_baseline_evaluation(
 
     # ── 2. XGBoost ───────────────────────────────────────────────────────
     logger.info("=" * 60)
-    logger.info("BASELINE 1: XGBoost (direct multi-step)")
+    logger.info("BASELINE 1: XGBoost (recursive multi-step)")
     logger.info("=" * 60)
 
     for target in targets:
@@ -117,19 +122,21 @@ def run_baseline_evaluation(
         xgb_model = XGBoostForecaster(
             target_col=target,
             horizon=horizon,
+            feature_cols=feat_cols,
         )
         xgb_model.fit(train, val_df=val)
         xgb_model.save(models_dir / f"xgboost_{target}")
 
         for split_name, split_df, history in [
-            ("val",  val,  None),   # val has train as warmup — already in model state
-            ("test", test, val),    # test cold-starts at 2023-01-01; pass val as warmup
+            ("val",  val,  train),
+            ("test", test, val),
         ]:
             result = xgb_model.evaluate(split_df, split_name=split_name, history_df=history)
             registry.add(result)
 
             # Horizon error curve
-            preds = xgb_model.predict(split_df)
+            combined = pd.concat([history, split_df])
+            preds = xgb_model.predict(combined)[len(history):]
             _save_horizon_plot(
                 preds, split_df[target].values,
                 model_name="xgboost", target=target,
@@ -139,7 +146,7 @@ def run_baseline_evaluation(
 
         # Feature importance plot (h=1)
         _save_importance_plot(
-            xgb_model.feature_importance(horizon_step=1),
+            xgb_model.feature_importance(),
             model_name="xgboost", target=target,
             out_dir=results_dir / "baseline_plots",
         )
@@ -230,7 +237,7 @@ def _save_forecast_plot(
     ax.plot(y_pred[:n_hours],  label=model_name,  lw=1.2, color="crimson", alpha=0.85)
     ax.set_title(f"{model_name.upper()} — {target} (first {n_hours}h of test set)")
     ax.set_xlabel("Hour")
-    ax.set_ylabel("MW")
+    ax.set_ylabel(get_target_unit(target))
     ax.legend()
     plt.tight_layout()
     path = out_dir / f"{model_name}_{target}_forecast.png"
@@ -252,35 +259,19 @@ def _save_horizon_plot(
     if preds.ndim == 1:
         return  # can't compute horizon curve for 1-D output
 
-    rows = []
-    for h in range(min(horizon, preds.shape[1])):
-        yp = preds[:, h]
-        yt = y_true
-        # Shift true values to align with h-step-ahead predictions
-        if h > 0:
-            yt = np.roll(y_true, -h)
-            yt[-h:] = np.nan
-        mask = np.isfinite(yt) & np.isfinite(yp)
-        if mask.sum() == 0:
-            continue
-        rows.append({
-            "horizon": h + 1,
-            "mae":  float(np.mean(np.abs(yt[mask] - yp[mask]))),
-            "rmse": float(np.sqrt(np.mean((yt[mask] - yp[mask]) ** 2))),
-        })
-
-    if not rows:
+    hdf = eval_by_horizon(y_true, preds, max_horizon=horizon)
+    hdf = hdf.dropna(subset=["mae", "rmse"])
+    if hdf.empty:
         return
-
-    hdf = pd.DataFrame(rows)
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 3))
     ax1.plot(hdf["horizon"], hdf["mae"],  marker="o", ms=3, color="steelblue")
     ax1.set_title("MAE by horizon")
-    ax1.set_xlabel("h (hours ahead)"); ax1.set_ylabel("MAE [MW]")
+    unit = get_target_unit(target)
+    ax1.set_xlabel("h (hours ahead)"); ax1.set_ylabel(f"MAE [{unit}]")
 
     ax2.plot(hdf["horizon"], hdf["rmse"], marker="o", ms=3, color="crimson")
     ax2.set_title("RMSE by horizon")
-    ax2.set_xlabel("h (hours ahead)"); ax2.set_ylabel("RMSE [MW]")
+    ax2.set_xlabel("h (hours ahead)"); ax2.set_ylabel(f"RMSE [{unit}]")
 
     plt.suptitle(f"{model_name.upper()} — {target} [{split}]", fontsize=11)
     plt.tight_layout()

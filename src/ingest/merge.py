@@ -52,6 +52,7 @@ Saved artefacts:
   processed/master_mask.parquet  – bool mask of originally-missing values
 """
 
+import json
 import logging
 from pathlib import Path
 
@@ -62,6 +63,7 @@ from .opsd import load_opsd
 from .smard import load_smard
 
 logger = logging.getLogger(__name__)
+MASTER_CACHE_VERSION = 2
 
 GAP_FILL_LIMIT = 3  # hours — forward-fill gaps no longer than this
 
@@ -120,10 +122,11 @@ def _backfill_opsd_from_smard(
 
         # Align SMARD values to OPSD index (inner, so extra SMARD rows are ignored)
         smard_aligned = smard[smard_col].reindex(opsd.index)
-        opsd.loc[missing_mask, opsd_col] = smard_aligned[missing_mask].values
-        opsd[f"{opsd_col}_from_smard"] = missing_mask.astype(bool)
+        filled_mask = missing_mask & smard_aligned.notna()
+        opsd.loc[filled_mask, opsd_col] = smard_aligned[filled_mask].values
+        opsd[f"{opsd_col}_from_smard"] = filled_mask
 
-        n_filled = (~opsd[opsd_col].isna() & missing_mask).sum()
+        n_filled = int(filled_mask.sum())
         logger.info(
             "OPSD backfill: '%s' ← '%s': filled %d / %d missing rows.",
             opsd_col, smard_col, n_filled, n_missing,
@@ -158,10 +161,23 @@ def build_master(
     processed_dir.mkdir(parents=True, exist_ok=True)
     master_cache = processed_dir / "master.parquet"
     mask_cache   = processed_dir / "master_mask.parquet"
+    meta_cache   = processed_dir / "master.meta.json"
+    cache_spec = {
+        "version": MASTER_CACHE_VERSION,
+        "start": start,
+        "end": end or pd.Timestamp.utcnow().date().isoformat(),
+        "gap_fill_limit": GAP_FILL_LIMIT,
+    }
 
-    if master_cache.exists() and not force:
-        logger.info("Loading cached master dataset from %s", master_cache)
-        return pd.read_parquet(master_cache)
+    if master_cache.exists() and mask_cache.exists() and meta_cache.exists() and not force:
+        try:
+            with open(meta_cache, encoding="utf-8") as f:
+                cached_spec = json.load(f)
+            if cached_spec == cache_spec:
+                logger.info("Loading cached master dataset from %s", master_cache)
+                return pd.read_parquet(master_cache)
+        except (OSError, ValueError):
+            logger.warning("Master cache metadata is unreadable; rebuilding.")
 
     # ── 1. Load each source ──────────────────────────────────────────────
     logger.info("Loading OPSD …")
@@ -235,6 +251,8 @@ def build_master(
     # ── 11. Persist ───────────────────────────────────────────────────────
     master.to_parquet(master_cache)
     missing_mask.to_parquet(mask_cache)
+    with open(meta_cache, "w", encoding="utf-8") as f:
+        json.dump(cache_spec, f, indent=2)
     logger.info("Saved master → %s", master_cache)
     logger.info("Saved missing mask → %s", mask_cache)
 

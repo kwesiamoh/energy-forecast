@@ -204,6 +204,10 @@ class SARIMAForecaster(BaseForecaster):
         """
         Rolling-origin forecast that assimilates each actual observation only
         after issuing the forecast for that timestamp.
+
+        The evaluation index must begin exactly one hour after the fitted model
+        index and remain contiguous. Its timestamps are preserved while an
+        explicit hourly frequency is restored for statsmodels state updates.
         """
         if not self.is_fitted:
             raise RuntimeError("Model not fitted.")
@@ -212,16 +216,53 @@ class SARIMAForecaster(BaseForecaster):
         n = len(series)
         preds = np.full((n, self.horizon), np.nan)
 
+        fitted_index = self._model.model._index
+        if not isinstance(fitted_index, pd.DatetimeIndex):
+            raise ValueError(
+                "SARIMA rolling evaluation requires a fitted DatetimeIndex."
+            )
+
+        expected_index = pd.date_range(
+            start=fitted_index[-1] + pd.Timedelta(hours=1),
+            periods=n,
+            freq="h",
+        )
+        if not isinstance(series.index, pd.DatetimeIndex) or not series.index.equals(
+            expected_index
+        ):
+            raise ValueError(
+                "SARIMA rolling evaluation index must be contiguous hourly and "
+                "begin exactly one hour after the fitted sample. "
+                f"Expected {expected_index[0]} through {expected_index[-1]}; "
+                f"got {series.index[0]} through {series.index[-1]}."
+            )
+
+        series = series.copy()
+        series.index = expected_index
+
         updated = self._model
+        self._logger.info("SARIMA rolling evaluation: 0/%d origins complete.", n)
         for i in range(n):
-            try:
-                preds[i] = np.asarray(
-                    updated.forecast(steps=self.horizon), dtype=float
-                )
-                updated = updated.append(series.iloc[[i]], refit=False)
-            except Exception as e:
-                self._logger.warning(
-                    "Rolling forecast failed at origin %d: %s", i, e
+            # Forecast before assimilating the observation at this origin.
+            preds[i] = np.asarray(
+                updated.forecast(steps=self.horizon), dtype=float
+            )
+            observation = pd.Series(
+                [series.iloc[i]],
+                index=pd.date_range(series.index[i], periods=1, freq="h"),
+                name=series.name,
+            )
+            # ``extend`` filters only the new observation from the current
+            # state, preserving fixed parameters without rebuilding the full
+            # historical results object as ``append(..., refit=False)`` does.
+            updated = updated.extend(observation)
+
+            completed = i + 1
+            if completed % 1_000 == 0 or completed == n:
+                self._logger.info(
+                    "SARIMA rolling evaluation: %d/%d origins complete.",
+                    completed,
+                    n,
                 )
 
         return preds

@@ -114,6 +114,8 @@ class FitScaler:
             if col not in df.columns:
                 continue
             mask = df[col].notna()
+            if not mask.any():
+                continue
             df.loc[mask, col] = scaler.transform(
                 df.loc[mask, [col]]
             ).flatten().astype("float32")
@@ -229,8 +231,8 @@ def split_and_scale(
         len(train), len(val), len(test),
     )
 
-    # Drop early NaN rows caused by lag features (up to 168 rows)
-    train = train.dropna(subset=target_cols + feature_cols, how="any")
+    # Preserve chronological splits. Each model selects valid rows using its
+    # target and the feature columns it actually resolves.
 
     t_scaler = FitScaler(method=target_method,  columns=target_cols)
     f_scaler = FitScaler(method=feature_method, columns=feature_cols)

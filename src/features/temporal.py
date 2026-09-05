@@ -20,21 +20,14 @@ Temporal features must avoid computing statistics
 that included the current timestep t, meaning the model could indirectly see
 y[t] while predicting y[t].
 
-Implementation considerations:
-  - add_diff_features used df[col].diff(d) directly, which computes
-    y[t] − y[t-d].  For d=1 this means the feature at time t is
-    y[t] − y[t-1], which requires knowing y[t].
-  - add_rolling_features needed an explicit .shift(1) before .rolling()
-    to guarantee the window closes at t-1, not t.
-
 Implementation:
-  - add_diff_features now computes:   series.shift(1).diff(d)
+  - add_diff_features computes:       series.shift(1).diff(d)
     → feature at t  =  y[t-1] − y[t-1-d]   (strictly backward-looking)
   - add_rolling_features: .shift(1) is applied to the raw series BEFORE
     calling .rolling(), ensuring the window at t covers [t-window … t-1].
   - add_lag_features: lags are inherently leakage-free (shift(k) for k≥1).
 
-All features for timestep t are now derived strictly from y[t-1] and earlier.
+All features for timestep t are derived strictly from y[t-1] and earlier.
 
 Features produced (example for target "load_mw")
 ─────────────────────────────────────────────────
@@ -108,14 +101,9 @@ def add_rolling_features(
     """
     Append rolling mean and std features for each target column.
 
-    LEAKAGE FIX: The series is shifted by 1 BEFORE applying the rolling
-    window.  This ensures:
+    The series is shifted by one before applying the rolling window:
       - The window for timestep t covers  [t - window, ..., t - 1]
       - y[t] itself is NEVER included in its own rolling statistic.
-
-    Without this shift, the rolling mean at time t would include y[t]
-    itself — direct target leakage that would inflate model performance
-    metrics while making the model useless at inference time.
 
     Args:
         df:                DataFrame with hourly DatetimeIndex.
@@ -131,10 +119,7 @@ def add_rolling_features(
             logger.warning("Rolling target '%s' not found — skipping.", col)
             continue
 
-        # LEAKAGE FIX: shift(1) ensures the rolling window closes at t-1.
-        # The window at time t then covers [t-window … t-1], never including
-        # y[t].  Without this shift the rolling mean would be a form of
-        # target leakage.
+        # Shift by one step so the window contains only observations before t.
         shifted = df[col].shift(1)
 
         for w in windows:
@@ -155,16 +140,9 @@ def add_diff_features(
     """
     Append first-difference features (velocity / rate-of-change).
 
-    LEAKAGE FIX — leakage-free diffs via shift(1):
-      Unsafe form:
-        df[col].diff(d)          → y[t] − y[t-d]  ← requires knowing y[t]!
-
-      Used form:
-        df[col].shift(1).diff(d) → y[t-1] − y[t-1-d]  ← strictly causal
-
-      The fixed version captures the same velocity signal but computed one
-      step earlier, so the model sees "how fast was the series changing
-      just before t" rather than "how much did it change arriving at t".
+    Differences are computed from the series shifted by one step:
+        df[col].shift(1).diff(d) → y[t-1] − y[t-1-d]
+    This describes the rate of change immediately before t.
 
     Features produced:
       {col}_diff1   – y[t-1] − y[t-2]        (1-step velocity at t-1)
@@ -183,9 +161,7 @@ def add_diff_features(
             logger.warning("Diff target '%s' not found — skipping.", col)
             continue
 
-        # LEAKAGE FIX: shift(1) before diff() makes these strictly causal.
-        # diff(d) on the shifted series computes y[t-1] − y[t-1-d],
-        # which does not require observing y[t].
+        # diff(d) on the shifted series computes y[t-1] − y[t-1-d].
         shifted = df[col].shift(1)
 
         for d in diffs:
@@ -223,11 +199,8 @@ def add_all_temporal_features(
         df with all temporal features appended.
     """
     if targets is None:
-        # Include all available target candidates, including full SMARD mix
-        # and the carbon intensity target added for the thesis.
-        # The four SMARD minor-renewable series are added here to match the
-        # expanded TARGET_COLS in pipeline.py — temporal features are generated
-        # for them automatically without requiring any notebook changes.
+        # Include all available target candidates, including the SMARD mix
+        # and carbon intensity.
         candidates = [
             # OPSD primaries (SMARD-backfilled post-2020)
             "load_mw", "solar_mw", "wind_onshore_mw", "wind_offshore_mw",
@@ -239,7 +212,7 @@ def add_all_temporal_features(
             # Remaining SMARD generation mix (for full-mix modelling)
             "biomass_mw", "run_of_river_mw", "nuclear_mw",
             "lignite_mw", "hard_coal_mw", "gas_mw",
-            # Derived thesis target
+            # Derived carbon-aware forecasting target
             "carbon_intensity_g_kwh",
         ]
         targets = [c for c in candidates if c in df.columns]

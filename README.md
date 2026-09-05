@@ -1,311 +1,312 @@
-# 🌍 Energy and Carbon Intensity Forecasting Pipeline
+# Energy and Carbon Intensity Forecasting
+
+A research-oriented forecasting framework for the German electricity system, combining open power-system data, weather observations, engineered time-series features, classical baselines, gradient boosting, and zero-shot time-series foundation models.
 
-This project builds an end-to-end forecasting pipeline for the German power grid.
+The project addresses two connected research questions:
 
-The work focuses on two connected questions:
+1. **How do statistical, feature-based, and zero-shot foundation models compare when forecasting key German electricity-system variables over a 24-hour horizon?**
+2. **How does the observed generation state of the system relate to production-based carbon intensity?**
 
-1. How much electricity will the grid need?
-2. How carbon-intensive will that electricity be?
+In practical terms, the project asks which forecasting approaches work best for different parts of the electricity system, how their accuracy changes with forecast horizon, and when the German grid tends to be more or less carbon intensive.
 
-Instead of treating electricity demand as a purely numerical forecasting task, this project links demand, generation mix, weather conditions, and emissions into one structured pipeline. The aim is to forecast not only grid load, but also the carbon intensity of electricity in real time, measured in gCO₂eq/kWh.
+The pipeline covers ingestion, hourly UTC alignment, feature engineering, chronological evaluation, multi-model benchmarking, and scientific visualization. The final benchmark spans nine targets and compares simple seasonal baselines, SARIMA, XGBoost, Chronos-T5-small, TimesFM 2.5, and Moirai 2.0 Small.
 
-This makes the problem more practical: electricity is not equally clean at every hour of the day. A kilowatt-hour consumed during high renewable generation can have a very different emissions impact from one consumed during fossil-heavy periods.
+## What this project contributes
 
----
+- A reproducible hourly German electricity dataset assembled from OPSD, SMARD, and Meteostat.
+- A leakage-aware forecasting benchmark spanning nine electricity and carbon-intensity targets.
+- A controlled comparison between seasonal/statistical baselines, feature-based XGBoost, and three zero-shot time-series foundation models.
+- A common 24-hour forecast contract that makes short-horizon and horizon-wise model behavior directly comparable.
+- An energy-system interpretation linking residual load, renewable generation, and a derived production-based carbon-intensity estimate.
 
-## 🔧 Overview
+## Key results
 
-The pipeline combines German power system data, weather data, physical feature engineering, classical machine learning, and time-series foundation models.
+The final reported results use the **FULL** test benchmark. **MAE is the primary metric**, with RMSE secondary and R² supplementary. MAPE is not emphasized because zero and near-zero generation periods can make percentage errors unstable.
 
-It follows the full workflow from raw data ingestion to model evaluation:
+### Best h=1 MAE by target
 
-- collecting and aligning grid and weather data
-- estimating emissions and carbon intensity
-- engineering physically meaningful forecasting features
-- training baseline forecasting models
-- comparing classical machine learning with a pre-trained foundation model
-- analyzing forecast stability, error propagation, and grid-level carbon patterns
+| Target | Best model | MAE | Unit |
+|---|---|---:|---|
+| Load | XGBoost | 492.8 | MW |
+| Solar | TimesFM 2.5 | 365.1 | MW |
+| Wind Onshore | TimesFM 2.5 | 513.0 | MW |
+| Wind Offshore | TimesFM 2.5 | 243.9 | MW |
+| Biomass | TimesFM 2.5 | 28.7 | MW |
+| Run-of-River | Chronos-T5-small | 61.4 | MW |
+| Pumped Storage Generation | Moirai 2.0 Small | 338.4 | MW |
+| Other Renewables | TimesFM 2.5 | 1.5 | MW |
+| Carbon Intensity | Chronos-T5-small | 8.9 | gCO₂eq/kWh |
 
----
+No single model dominates all nine targets.
 
-## ⚡ Phase 1 — Data Ingestion and Energy System Setup
+For load, XGBoost is strongest at **h=1**, but the horizon analysis shows a different longer-range picture. Its recursive error grows faster across the 24-hour rollout, while Chronos-T5-small and TimesFM 2.5 remain substantially more stable at longer horizons. This is why the project reports both an all-model h=1 leaderboard and horizon-wise error from h=1 to h=24.
 
-The first step was to build a reliable hourly dataset for the German power grid.
+## Pipeline
 
-I combined multiple open datasets, including OPSD, SMARD, and Meteostat, and aligned them into a common hourly UTC timeline.
+```text
+OPSD / SMARD / Meteostat
+          |
+          v
+Hourly UTC merge and source validation
+          |
+          v
+Feature engineering and chronological splits
+          |
+          +----------------------------+
+          |                            |
+          v                            v
+Seasonal / SARIMA / XGBoost      Chronos / TimesFM / Moirai
+          |                            |
+          +-------------+--------------+
+                        |
+                        v
+            Common evaluation contract
+                        |
+                        v
+             Metrics and scientific plots
+```
 
-The dataset includes the main components of the German generation mix:
+The notebook workflow is:
 
-- lignite
-- hard coal
-- gas
-- nuclear
-- wind
-- solar
-- biomass
-- run-of-river hydro
-- pumped storage
+1. `01_data_ingestion.ipynb` - ingestion, merging, source checks
+2. `02_feature_engineering.ipynb` - calendar, weather, lag, rolling, and difference features
+3. `03_baselines.ipynb` - seasonal-naive, SARIMA, and XGBoost baselines
+4. `04_foundation.ipynb` - Chronos, TimesFM, and Moirai zero-shot benchmark
+5. Scientific visualization - final local plotting stage; exported figures are stored under `docs/figures/`
 
-From these raw inputs, the pipeline derives several quantities that are important for both forecasting and interpretation:
+## Data and forecast targets
 
-- total electricity generation
-- residual load
-- estimated carbon emissions
-- carbon intensity in gCO₂eq/kWh
+The project combines three open data sources:
 
-The result is a unified dataset with roughly 80,000 hourly observations and more than 30 core variables.
+- **Open Power System Data (OPSD)** - German load and renewable generation
+- **SMARD / Bundesnetzagentur** - German electricity-system and generation data
+- **Meteostat** - historical weather observations
 
-#### 📊 Macro Dataset Overview
+All sources are aligned to a continuous hourly UTC index.
 
-<img width="3634" height="1534" alt="macro_overview" src="https://github.com/user-attachments/assets/a5cd8fe9-e5f7-4b26-9f8a-665142d73bc8" />
+The nine forecast targets are:
 
----
+- Load
+- Solar
+- Wind Onshore
+- Wind Offshore
+- Biomass
+- Run-of-River
+- Pumped Storage Generation
+- Other Renewables
+- Carbon Intensity
 
-## 🧠 Phase 2 — Feature Engineering
+Carbon intensity is a **derived production-based estimate**, calculated from the German generation mix using fixed lifecycle-emission factors and source-completeness checks. It is not an official measured carbon-intensity series and should not be interpreted as a consumption-based measure that fully accounts for cross-border electricity flows.
 
-After building the core dataset, I developed a feature engineering layer for time-series forecasting.
+For the hourly SMARD generation targets stored in MWh, one-hour energy values are numerically equivalent to average MW over that hour for the plots and benchmark presentation.
 
-The features are designed to capture three types of structure:
+## Benchmark design
 
-### Calendar structure
+### Chronological split
 
-Electricity demand follows strong daily, weekly, and seasonal rhythms, so the pipeline includes:
+- **Training:** through 2021-12-31
+- **Validation:** 2022
+- **Test:** from 2023-01-01 onward
 
-- hour of day
-- weekday
-- weekend indicators
-- seasonal patterns
-- holiday effects
+The split boundaries are mutually exclusive and no shuffling is used.
 
-### Weather-driven structure
+### Forecast contract
 
-Weather affects both electricity demand and renewable generation. The pipeline includes features such as:
+The main benchmark uses:
 
-- temperature-based heating and cooling degree indicators
-- wind power density proxies based on wind speed
-- solar-related proxies
-- weather station aggregation and validation
+- 24-hour forecast horizon
+- common forecast timestamps
+- h=1 in prediction column 0
+- h=24 in prediction column 23
+- `(N, 24)` multi-horizon prediction arrays
+- FULL and QUICK runs stored separately
 
-### Temporal structure
+For the zero-shot foundation models:
 
-To help the models learn from recent system behavior, the pipeline adds:
+- 168-hour target-history context
+- univariate target history only
+- no engineered features
+- no future target observations
+- common forecast origins and timestamps across Chronos, TimesFM, and Moirai
 
-- lagged values
-- rolling statistics
-- differences
-- historical target behavior
+The final h=1 comparable benchmark contains **55 model-target results**:
 
-A strict causal setup is used throughout. The model only receives information that would have been available at prediction time. This avoids data leakage and keeps the forecasting problem realistic.
+| Model | Final target coverage |
+|---|---:|
+| Seasonal Naive 24 h | 9 / 9 |
+| Seasonal Naive 168 h | 9 / 9 |
+| XGBoost | 9 / 9 |
+| SARIMA | 1 / 9 (Load only) |
+| Chronos-T5-small | 9 / 9 |
+| TimesFM 2.5 | 9 / 9 |
+| Moirai 2.0 Small | 9 / 9 |
 
-#### 🕵️‍♂️ Missing Data & Sensor Auditing
+## Models
 
-<img width="3034" height="1534" alt="missing_data_heatmap" src="https://github.com/user-attachments/assets/218cd5ae-ac92-43ef-bff3-70a7f985154b" />
+### Simple and statistical baselines
 
-*Sensor availability was audited across the full 8-year timeline before applying forward-filling, interpolation, and sparse-sensor filtering.*
+**Seasonal Naive (24 h / 168 h)** provides daily and weekly reference forecasts.
 
-The final feature-engineered dataset contains around 150 model-ready features.
+**SARIMA** is evaluated as a rolling-origin statistical baseline. In the final FULL benchmark it is included for **Load only**.
 
----
+### XGBoost
 
-## ⚙️ Phase 2.5 — Data Splitting and Scaling
+XGBoost is the feature-based machine-learning baseline.
 
-The data is split chronologically into training, validation, and test sets.
+It is trained as a one-step model and recursively rolled forward to 24 hours. Its inputs include causal target-history features, calendar features, and forecast-origin weather information. During recursive rollout:
 
-No shuffling is used, because time order matters in forecasting. The model is evaluated on future periods that were not seen during training.
+- target lag, rolling, and difference features are rebuilt from a consecutive history buffer;
+- calendar features advance to each forecast timestamp;
+- unknown future weather is represented by persistence from the forecast origin.
 
-Scaling is also handled carefully to prevent leakage between training and evaluation periods.
+This makes XGBoost intentionally different from the target-only zero-shot foundation models.
 
----
+### Foundation models
 
-## 📊 Phase 3 — Baseline Models
+The project evaluates three pretrained time-series foundation models in zero-shot mode:
 
-The first modeling stage uses classical forecasting baselines.
+- **Chronos-T5-small**
+- **TimesFM 2.5**
+- **Moirai 2.0 Small**
 
-The main machine learning baseline is XGBoost, implemented with a recursive multi-step forecasting strategy. A SARIMA model is also included as a statistical reference point.
+All three receive the same 168-hour target context and predict the same 24-hour horizon.
 
-The forecast targets are:
+Their q10, q50, and q90 outputs are also persisted when genuinely available. These quantiles are used descriptively; formal calibration ranking is outside the scope of the benchmark.
 
-- grid load in MW
-- carbon intensity in gCO₂eq/kWh
+## Results
 
----
+### German electricity dataset and selected generation components
 
-## 🔁 Recursive Rollout Strategy
+The overview below shows load, selected generation components, and the chronological train/validation/test periods. The stacked generation areas are **selected components**, not the complete German generation mix used elsewhere in the data pipeline.
 
-The XGBoost model is trained for a one-step-ahead forecast.
+![German electricity dataset and selected generation components](docs/figures/macro_overview.png)
 
-To predict multiple hours into the future, the model feeds its own prediction back into the lag features and repeats the process across the forecast horizon.
+### Load forecast error by horizon
 
-This solved the initial issue of overly flat predictions, but it also exposed a known limitation of recursive forecasting:
+This is the main multi-horizon comparison for load. XGBoost is strongest at the first forecast step, but its recursive error rises more quickly as the horizon increases. Chronos-T5-small and TimesFM 2.5 degrade more slowly across the 24-hour window.
 
-> small errors at early horizons become inputs for later horizons, causing forecast drift over time.
+![Load forecast error by horizon](docs/figures/horizon_error_comparison.png)
 
-This behavior is especially visible across a 24-hour window. XGBoost can track short-term changes, but its stability decreases as the horizon grows.
+### Multi-target FULL h=1 benchmark
 
----
+The h=1 leaderboard gives the broadest common comparison across model families, including SARIMA for Load. Each target is ranked independently by MAE because the targets have different physical scales.
 
-## 🤖 Phase 4 — Foundation Model: Chronos-T5
+![FULL test h=1 MAE leaderboard](docs/figures/mae_leaderboard_h1.png)
 
-To compare the classical approach with a modern sequence model, I tested Amazon Chronos-T5.
+### Carbon intensity and residual load
 
-Chronos was used in zero-shot mode. It was not fine-tuned on this specific German grid dataset.
+Residual load is defined here as electricity demand minus the selected renewable generation components used in the analysis. Lower residual load tends to coincide with lower carbon intensity in this dataset.
 
-Instead of relying on manually engineered features, Chronos receives a 168-hour context window and forecasts directly from the raw time-series sequence.
+This is an observed association, not a causal claim.
 
-This creates a useful comparison between two modeling philosophies:
+![Carbon intensity vs residual load](docs/figures/carbon_vs_residual_load.png)
 
-- XGBoost depends on carefully designed domain features.
-- Chronos relies on pre-trained temporal sequence understanding.
+## Methodological safeguards
 
-The question is whether a foundation model can capture the structure of a physical energy system without requiring hand-built weather, calendar, and lag features.
+The project includes several controls intended to keep the benchmark reproducible and leakage-aware:
 
----
+- target lags, rolling statistics, and difference features use historical values only;
+- same-hour regional load variables and raw observed wind generation are excluded from the canonical XGBoost feature set;
+- the observed-generation-derived `clearsky_index` remains diagnostic only and is excluded from model features;
+- feature missingness decisions are learned from the training period;
+- chronological splits are mutually exclusive;
+- XGBoost recursive history is rebuilt from a complete consecutive target buffer;
+- forecast timestamps use one explicit h=1...h=24 alignment convention;
+- QUICK and FULL runs are stored separately;
+- metric records are upserted/deduplicated rather than blindly appended.
 
-## 📊 Results
+## Running the project
 
-### 168-Hour Forecast Comparison
+Python 3.12 is recommended for the tested dependency stack.
 
-<img width="3634" height="1235" alt="showdown_168h" src="https://github.com/user-attachments/assets/b77a5a2d-be4a-4447-b051-90b6f1dbccba" />
+### 1. Create an environment
 
-Chronos follows the actual signal more closely across longer horizons.
+```bash
+python -m venv .venv
+```
 
-XGBoost performs reasonably in the near term, but gradually moves away from the observed trajectory as recursive errors accumulate.
+Activate it using the command appropriate for your operating system, then install:
 
-This difference becomes important when the forecast is used for planning rather than only short-term prediction.
+```bash
+python -m pip install -r requirements.txt
+```
 
----
+### 2. Run the workflow
 
-### Horizon Error Propagation
+Execute the notebooks in order:
 
-<img width="2434" height="1234" alt="horizon_error" src="https://github.com/user-attachments/assets/db70ec28-4db7-4d22-a83f-5ca9e4674888" />
+```text
+01_data_ingestion.ipynb
+02_feature_engineering.ipynb
+03_baselines.ipynb
+04_foundation.ipynb
+```
 
-The horizon-level error analysis shows a clear pattern:
+Use **QUICK** first as an integration/smoke test. Use **FULL** for final benchmark results.
 
-- XGBoost error increases as the forecast horizon grows.
-- Chronos remains more stable across the full 24-hour window.
+The final reported results in this README are from FULL evaluation only.
 
-This points to a structural difference between the approaches. Recursive tree-based models are sensitive to their own previous mistakes, while the foundation model forecasts the sequence more directly.
+### CPU and CUDA
 
----
+Foundation-model adapters support CPU execution and NVIDIA CUDA when available. CUDA is selected only when the active PyTorch installation reports it as available.
 
-## 📈 Key Outputs
+GPU memory primarily affects usable batch size; reducing batch size is preferable to silently changing the benchmark.
 
-The pipeline produces the following main artifacts:
+## Optional Moirai compatibility
 
-- `master.parquet` — cleaned and merged hourly dataset
-- `features.parquet` — feature-engineered forecasting dataset
-- `baseline_table.csv` — baseline model metrics
-- `leaderboard.csv` — model comparison table
-- forecast plots for load and carbon intensity
-- residual load and carbon intensity analysis
-- uncertainty interval visualizations
+Moirai requires `uni2ts==2.0.0`.
 
-### 🏆 Multi-Target R² Leaderboard
+Where Uni2TS is compatible with the installed PyTorch stack, all foundation models can run in the same environment.
 
-<img width="2734" height="2689" alt="r2_leaderboard" src="https://github.com/user-attachments/assets/5b9a323d-4a77-401b-8102-c83d8873ccd1" />
+```bash
+python -m pip install "uni2ts==2.0.0"
+```
 
----
+If Uni2TS conflicts with the main PyTorch environment, Notebook 04 supports an optional neutral artifact-handoff workflow:
 
-## 🔬 Physical Insights
+1. build the common benchmark contexts and timestamps in the main project runtime;
+2. export neutral Moirai benchmark inputs;
+3. run Moirai in any compatible environment;
+4. restore the validated output artifacts into the main evaluation path.
 
-The project is not only about model accuracy. It also uses the data and forecasts to study how the grid behaves physically.
+The separate runtime is therefore a compatibility fallback, not a requirement of the scientific benchmark.
 
-### Carbon Intensity and Residual Load
+## Methodological limitations
 
-<img width="2434" height="1534" alt="carbon_vs_residual_load" src="https://github.com/user-attachments/assets/fcf51b0e-f701-4c0c-9ba7-07f994ba3f9c" />
+The benchmark should be interpreted with the following constraints:
 
-Residual load is the part of demand that remains after renewable generation has been accounted for.
+- **Different information sets:** XGBoost uses engineered historical, calendar, and weather features, while the foundation models are zero-shot and target-only.
+- **Future weather assumption:** recursive XGBoost persists weather observed at the forecast origin when future weather values are unavailable.
+- **Carbon-intensity scope:** the carbon target is a production-based derived proxy rather than an official consumption-based grid-intensity measure.
+- **Probabilistic outputs:** q10/q50/q90 intervals are presented descriptively; the project does not claim a formal probabilistic calibration ranking.
+- **Research scope:** the framework is designed for reproducible comparative forecasting, not as a production-grade operational forecasting service.
 
-When residual load is low, renewables are covering more of the system demand. In those periods, carbon intensity tends to drop.
+## Data sources
 
-The relationship is strongly visible in the data: as residual load decreases, carbon intensity decreases as well. This gives the model output a physical interpretation, not just a statistical one.
+- [Open Power System Data](https://open-power-system-data.org/)
+- [SMARD / Bundesnetzagentur](https://www.smard.de/)
+- [Meteostat](https://meteostat.net/)
 
----
+## Repository outputs
 
-### Temporal Load Shifting Opportunity
+Main generated artifacts include:
 
-<img width="3028" height="1384" alt="diurnal_seasonal_carbon_heatmap" src="https://github.com/user-attachments/assets/bea84602-8f3b-4497-980a-0626fdf3290f" />
+- merged hourly data
+- feature-engineered data
+- model checkpoints
+- QUICK and FULL prediction artifacts
+- baseline and foundation-model metric registries
+- horizon-wise evaluation outputs
+- final scientific figures
 
-Carbon intensity changes by both hour of day and season.
+Large generated data, checkpoints, and experiment artifacts are intentionally kept out of Git where appropriate. The final README figures are tracked separately under `docs/figures/`.
 
-The heatmap highlights cleaner electricity windows, such as periods with strong solar generation during summer midday hours.
+## Summary
 
-This is useful for carbon-aware scheduling. Flexible electricity use, such as storage charging or energy-intensive processes, can be shifted toward lower-carbon periods when operationally possible.
+This project shows that model ranking depends strongly on both the **target** and the **forecast horizon**.
 
----
+XGBoost is the strongest h=1 model for Load, while zero-shot foundation models are highly competitive despite using only target history. TimesFM 2.5 leads several renewable-generation targets at h=1, Chronos-T5-small is consistently strong and leads Carbon Intensity, and Moirai 2.0 Small performs best on Pumped Storage Generation.
 
-### Foundation Model Uncertainty Quantification
+The 24-hour load horizon analysis is especially important: the feature-based recursive model has the strongest first step, but Chronos and TimesFM remain more stable as the forecast horizon grows.
 
-<img width="3034" height="1234" alt="chronos_uncertainty_intervals" src="https://github.com/user-attachments/assets/97f7bdb1-edd8-4441-ac09-ffdbf86f8ff1" />
-
-The Chronos forecasts are extended with empirical 80% prediction intervals.
-
-This gives a range of plausible future values instead of only a single forecast line.
-
-For grid-related applications, this matters because uncertainty affects planning. A forecast is more useful when it also communicates how confident the model is across the prediction horizon.
-
----
-
-## 🎯 Purpose
-
-This project was designed to connect machine learning with real energy-system behavior.
-
-The main objectives are to:
-
-- build a reproducible forecasting pipeline from raw data to evaluation
-- forecast both electricity demand and grid carbon intensity
-- study how the generation mix affects emissions
-- compare classical machine learning with time-series foundation models
-- keep the modeling setup causal and leakage-free
-- extract interpretable physical insights from the results
-
----
-
-## ⚡ Skills Demonstrated
-
-This project demonstrates work across data engineering, forecasting, machine learning, and energy-system analysis.
-
-Main technical areas:
-
-- time-series data processing
-- multi-source dataset integration
-- weather and power system data alignment
-- physical feature engineering
-- leakage-safe forecasting design
-- recursive multi-step forecasting
-- model benchmarking and evaluation
-- foundation model testing for time-series data
-- uncertainty estimation
-- carbon intensity analysis
-
-Energy and environmental focus:
-
-- German generation mix modeling
-- residual load analysis
-- emissions estimation
-- carbon-aware electricity use
-- linking process/environmental engineering with machine learning
-
----
-
-## 📊 Data Sources
-
-The pipeline uses open data sources:
-
-- Open Power System Data — load and generation data
-- SMARD / Bundesnetzagentur — German electricity market and grid data
-- Meteostat — historical weather data
-
-All sources are open and attributed in the repository.
-
----
-
-## 🧠 Conclusion
-
-This project showed that forecasting carbon intensity requires more than treating the problem as a standard time-series task. The behavior of the grid is closely tied to demand, renewable generation, residual load, weather conditions, and the changing generation mix.
-
-XGBoost worked well as a classical baseline, especially over shorter horizons. However, because the model uses recursive forecasting, errors from earlier predictions are carried forward and become more noticeable as the horizon increases.
-
-Chronos-T5 was more stable over longer forecast windows, despite being used in zero-shot mode and without the engineered weather, calendar, and lag features used by XGBoost. This made the comparison particularly useful: the two models approached the same forecasting problem in very different ways.
-
-Beyond model performance, the analysis also showed why carbon intensity forecasting can be useful in practice. Since the carbon content of electricity changes throughout the day, forecasts can help identify periods when flexible electricity demand could be shifted toward lower-carbon hours.
+The main achievement is therefore not a single winning model, but a reproducible benchmark in which different forecasting paradigms can be compared under explicit information assumptions. The results show that different approaches excel under different targets, horizons, and information settings, while the carbon-intensity analysis connects forecast performance back to the physical behavior of the electricity system.

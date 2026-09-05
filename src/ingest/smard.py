@@ -50,7 +50,7 @@ Carbon intensity:
   Each fuel type is multiplied by a standard lifecycle emission factor
   (g CO₂-eq / kWh) and the sum is divided by total generation.  This gives
   an hourly grid carbon intensity signal useful as both a feature and a
-  target for the thesis's carbon-aware forecasting component.
+  target for carbon-aware forecasting research.
 
   Emission factors (g CO₂-eq / kWh, lifecycle median values):
     Lignite (brown coal) : 1000
@@ -152,6 +152,11 @@ _EMISSION_FACTORS_G_KWH: dict[str, float] = {
     "nuclear_mwh":                12.0,
     "other_renewables_mwh":       40.0,   # proxy — solar-like
 }
+_MATERIAL_CARBON_COLS = (
+    "lignite_mwh", "hard_coal_mwh", "gas_mwh", "other_conventional_mwh"
+)
+_MIN_CARBON_SOURCE_COVERAGE = 0.80
+SMARD_CACHE_VERSION = 2
 
 
 # ── Session factory ───────────────────────────────────────────────────────────
@@ -234,23 +239,35 @@ def download_smard_series(
     raw_dir      = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
     final_cache  = raw_dir / f"smard_{filter_id}.json"
+    final_meta   = raw_dir / f"smard_{filter_id}.meta.json"
     chunk_dir    = raw_dir / f"smard_{filter_id}"
-
-    # Fast path — already fully downloaded
-    if final_cache.exists() and not force:
-        logger.info("Loading cached SMARD %d from %s", filter_id, final_cache)
-        with open(final_cache) as f:
-            data = json.load(f)
-        series = pd.Series(
-            {pd.Timestamp(k): float(v) for k, v in data.items()},
-            dtype="float32",
-        )
-        series.index = pd.DatetimeIndex(series.index, tz="UTC")
-        return series.sort_index()
-
-    chunk_dir.mkdir(exist_ok=True)
     start_ts = pd.Timestamp(start, tz="UTC")
     end_ts   = pd.Timestamp(end, tz="UTC") if end else pd.Timestamp.utcnow()
+    requested_end_date = end_ts.date().isoformat()
+
+    if final_cache.exists() and final_meta.exists() and not force:
+        try:
+            with open(final_meta, encoding="utf-8") as f:
+                metadata = json.load(f)
+            usable = (
+                metadata.get("complete") is True
+                and metadata.get("start") <= start_ts.date().isoformat()
+                and metadata.get("end") >= requested_end_date
+            )
+            if usable:
+                logger.info("Loading cached SMARD %d from %s", filter_id, final_cache)
+                with open(final_cache, encoding="utf-8") as f:
+                    data = json.load(f)
+                series = pd.Series(
+                    {pd.Timestamp(k): float(v) for k, v in data.items()},
+                    dtype="float32",
+                )
+                series.index = pd.DatetimeIndex(series.index, tz="UTC")
+                return series.sort_index().loc[start_ts:end_ts]
+        except (OSError, ValueError, TypeError):
+            logger.warning("SMARD %d cache metadata is unreadable; checking chunks.", filter_id)
+
+    chunk_dir.mkdir(exist_ok=True)
 
     logger.info(
         "Fetching SMARD filter %d (%s → %s) …",
@@ -314,6 +331,19 @@ def download_smard_series(
 
     with open(final_cache, "w") as f:
         json.dump({str(k): float(v) for k, v in series.items()}, f)
+    missing_chunks = [
+        ts_ms for ts_ms in in_range
+        if not (chunk_dir / f"{ts_ms}.json").exists()
+    ]
+    metadata = {
+        "complete": not missing_chunks,
+        "start": start_ts.date().isoformat(),
+        "end": requested_end_date,
+        "expected_chunks": total,
+        "missing_chunks": missing_chunks,
+    }
+    with open(final_meta, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
     logger.info(
         "Cached SMARD %d → %s  (%d rows, %d failed chunks)",
@@ -329,9 +359,8 @@ def _compute_carbon_intensity(df: pd.DataFrame) -> pd.Series:
     Compute hourly grid carbon intensity in g CO₂-eq / kWh.
 
     Each generation source is weighted by its lifecycle emission factor and
-    summed; the result is divided by total generation (MWh → kWh conversion
-    cancels because both numerator and denominator use MWh units at the same
-    scale — we want g/kWh so we adjust the denominator by ×1000).
+    summed; the result is divided by total generation. The common MWh scale
+    cancels, leaving the weighted-average factor in g CO₂-eq/kWh.
 
     Formula:
         carbon_intensity = Σ(gen_i [MWh] × ef_i [g/kWh]) / total_gen [MWh]
@@ -341,19 +370,21 @@ def _compute_carbon_intensity(df: pd.DataFrame) -> pd.Series:
         pd.Series of carbon intensity (g CO₂-eq / kWh), NaN where total
         generation is zero or unavailable.
     """
-    total_emissions = pd.Series(0.0, index=df.index, dtype="float64")
-    total_gen       = pd.Series(0.0, index=df.index, dtype="float64")
-
-    for col, ef in _EMISSION_FACTORS_G_KWH.items():
-        if col not in df.columns:
-            continue
-        gen = df[col].fillna(0.0).astype("float64")
-        total_emissions += gen * ef
-        total_gen       += gen
+    source_cols = list(_EMISSION_FACTORS_G_KWH)
+    generation = df.reindex(columns=source_cols).astype("float64")
+    coverage = generation.notna().mean(axis=1)
+    material_complete = generation[list(_MATERIAL_CARBON_COLS)].notna().all(axis=1)
+    known_generation = generation.fillna(0.0)
+    factors = pd.Series(_EMISSION_FACTORS_G_KWH, dtype="float64")
+    total_emissions = known_generation.mul(factors, axis=1).sum(axis=1)
+    total_gen = known_generation.sum(axis=1)
 
     # Guard against division by zero (e.g. maintenance windows, data gaps)
     total_gen_safe = total_gen.replace(0.0, float("nan"))
     ci = (total_emissions / total_gen_safe).astype("float32")
+    ci = ci.where(
+        (coverage >= _MIN_CARBON_SOURCE_COVERAGE) & material_complete
+    )
     ci.name = "carbon_intensity_g_kwh"
 
     non_nan = ci.notna().sum()
@@ -394,17 +425,38 @@ def load_smard(
     processed_dir = Path(processed_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
     cache = processed_dir / "smard.parquet"
+    cache_meta = processed_dir / "smard.meta.json"
+    cache_spec = {
+        "version": SMARD_CACHE_VERSION,
+        "start": start,
+        "end": end or pd.Timestamp.utcnow().date().isoformat(),
+    }
 
-    if cache.exists() and not force:
-        logger.info("Loading cached SMARD parquet from %s", cache)
-        return pd.read_parquet(cache)
+    if cache.exists() and cache_meta.exists() and not force:
+        try:
+            with open(cache_meta, encoding="utf-8") as f:
+                metadata = json.load(f)
+                matches = all(metadata.get(k) == v for k, v in cache_spec.items())
+                if matches and metadata.get("complete") is True:
+                    logger.info("Loading cached SMARD parquet from %s", cache)
+                    return pd.read_parquet(cache)
+        except (OSError, ValueError):
+            logger.warning("SMARD parquet metadata is unreadable; rebuilding.")
 
     all_series: dict[str, pd.Series] = {}
+    series_complete = []
     for filter_id, col_name in SMARD_FILTERS.items():
         s = download_smard_series(
             filter_id, raw_dir, start=start, end=end, force=force
         )
         all_series[col_name] = s
+        try:
+            with open(
+                Path(raw_dir) / f"smard_{filter_id}.meta.json", encoding="utf-8"
+            ) as f:
+                series_complete.append(json.load(f).get("complete") is True)
+        except (OSError, ValueError):
+            series_complete.append(False)
 
     df = pd.DataFrame(all_series)
     df.index.name = "timestamp"
@@ -438,4 +490,10 @@ def load_smard(
     )
 
     df.to_parquet(cache)
+    with open(cache_meta, "w", encoding="utf-8") as f:
+        json.dump(
+            {**cache_spec, "complete": bool(series_complete) and all(series_complete)},
+            f,
+            indent=2,
+        )
     return df

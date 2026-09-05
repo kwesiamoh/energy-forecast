@@ -8,7 +8,7 @@ autoregressively — no features needed, just past values.
 
 Paper: "Chronos: Learning the Language of Time Series" (Ansari et al. 2024)
 Repo:  https://github.com/amazon-science/chronos-forecasting
-Install: pip install amazon-chronos-t5 transformers accelerate
+Install: pip install chronos-forecasting transformers accelerate
 
 Model variants (smallest → largest, speed ↔ accuracy tradeoff):
     chronos-t5-tiny    ~8M  params   fastest, good for prototyping
@@ -34,8 +34,8 @@ This wrapper implements TWO modes:
 
   2. Fine-tuned:
      Call fit() to continue training the model on your OPSD series.
-     Uses the chronos fine-tuning script approach: converts the target
-     column into ChronosDataset format and runs a training loop with
+     Converts the target column into sliding context/forecast windows and
+     runs a training loop with
      AdamW + cosine LR schedule. Early stopping on val NLL.
 
 Context window strategy
@@ -49,15 +49,13 @@ allows, but diminishing returns beyond 168h for most energy targets.
 ═══════════════════════════════════════════════════════════════════════════════
 Sequence contiguity
 ═══════════════════════════════════════════════════════════════════════════════
-Context:
-  The feature pipeline drops rows with missing exogenous features, leaving gaps
+The feature pipeline can drop rows with missing exogenous features, leaving gaps
   in the DatetimeIndex passed to fit().  _make_sliding_windows maps array
   position directly to time step, so a gap of N hours would be silently treated
   as N consecutive 1-hour steps, misaligning every subsequent context/forecast
   pair and corrupting the temporal patterns learned during fine-tuning.
 
-Handling:
-  fit() now reindexes train_df and val_df onto a contiguous pd.date_range at
+fit() reindexes train_df and val_df onto a contiguous pd.date_range at
   "h" frequency before extracting the target series.  Gap positions become NaN.
   _make_sliding_windows already skips any window whose forecast target contains
   NaN (guard: `np.isnan(tgt_win).any()`), so no additional filtering is needed.
@@ -66,12 +64,12 @@ Handling:
 
 Batched inference
 ─────────────────
-predict() batches all forecast origins into a single forward pass using
-ChronosPipeline.predict(). This is orders of magnitude faster than
-looping row-by-row and is the correct way to use the Chronos API.
+predict() sends valid forecast origins to ChronosPipeline.predict() in
+configurable batches instead of calling the model once per origin.
 """
 
 import pickle
+import time
 from pathlib import Path
 
 import numpy as np
@@ -79,6 +77,8 @@ import pandas as pd
 import torch
 
 from .base import BaseForecaster
+from .device import resolve_device, resolve_dtype
+from .foundation_utils import iter_context_batches
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -103,22 +103,21 @@ class ChronosForecaster(BaseForecaster):
     Args:
         target_col:      Column in the feature DataFrame to forecast.
         horizon:         Forecast horizon in hours.
-        model_name:      HuggingFace model ID or local checkpoint path.
+        model_id:        HuggingFace model ID or local checkpoint path.
         context_length:  Number of past hours fed as context to the model.
         num_samples:     Monte Carlo samples (higher = better quantiles, slower).
-        device:          "cuda", "mps", or "cpu". Auto-detected if None.
+        device:          "auto", "cuda", or "cpu".
+        dtype:           "auto", "float32", "float16", or "bfloat16".
+        batch_size:      Number of forecast origins per inference call.
         finetune_config: Dict of fine-tuning hyperparameters (see FINETUNE_DEFAULTS).
         quantile_levels: Quantile levels to store in addition to median.
                          e.g. [0.1, 0.9] gives an 80% prediction interval.
     """
 
-    model_name_str = "chronos"  # used in MetricResult / leaderboard
-
     # BaseForecaster uses model_name as a class attribute — override it
     @property
     def model_name(self) -> str:  # type: ignore[override]
-        suffix = "ft" if self._is_finetuned else "zs"
-        return f"chronos-{suffix}"
+        return "chronos_t5_small_finetuned" if self._is_finetuned else "chronos_t5_small"
 
     def __init__(
         self,
@@ -127,7 +126,9 @@ class ChronosForecaster(BaseForecaster):
         model_id:        str = DEFAULT_MODEL,
         context_length:  int = DEFAULT_CONTEXT,
         num_samples:     int = DEFAULT_SAMPLES,
-        device:          str | None = None,
+        device:          str = "auto",
+        dtype:           str = "auto",
+        batch_size:      int = 16,
         finetune_config: dict | None = None,
         quantile_levels: list[float] | None = None,
     ):
@@ -135,14 +136,20 @@ class ChronosForecaster(BaseForecaster):
         self.model_id = model_id
         self.context_length = context_length
         self.num_samples = num_samples
-        self.device = device or _auto_device()
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        self._device_spec = resolve_device(device)
+        self.device = self._device_spec.name
+        self.dtype, self._torch_dtype = resolve_dtype(dtype, self._device_spec)
+        self.batch_size = batch_size
         self.finetune_config = {**FINETUNE_DEFAULTS, **(finetune_config or {})}
         self.quantile_levels = quantile_levels or [0.1, 0.5, 0.9]
 
         self._pipeline = None   # ChronosPipeline — loaded lazily
         self._is_finetuned = False
+        self.last_quantile_forecasts: dict[float, np.ndarray] = {}
+        self.last_runtime_seconds: float | None = None
         self.is_fitted = True
-        self._ft_checkpoint = None   # path to fine-tuned weights
 
     # ── Lazy pipeline loading ─────────────────────────────────────────────
 
@@ -152,19 +159,24 @@ class ChronosForecaster(BaseForecaster):
             from chronos import ChronosPipeline
         except ImportError:
             raise ImportError(
-                "Install Chronos: pip install amazon-chronos-t5 transformers accelerate"
+                "Install Chronos: pip install chronos-forecasting transformers accelerate"
             )
 
         source = str(checkpoint) if checkpoint else self.model_id
-        self._logger.info(
-            "Loading ChronosPipeline from '%s' on %s …", source, self.device)
+        self._logger.info("Loading ChronosPipeline from '%s'", source)
 
         self._pipeline = ChronosPipeline.from_pretrained(
             source,
             device_map=self.device,
-            torch_dtype=torch.bfloat16 if self.device != "cpu" else torch.float32,
+            dtype=self._torch_dtype,
         )
-        self._logger.info("Pipeline loaded.")
+        self._logger.info(
+            "Model: Chronos-T5-small | Device: %s | GPU: %s | dtype: %s | Batch size: %d",
+            self.device,
+            self._device_spec.gpu_name or "CPU",
+            self.dtype,
+            self.batch_size,
+        )
 
     # ── fit ───────────────────────────────────────────────────────────────
 
@@ -196,10 +208,9 @@ class ChronosForecaster(BaseForecaster):
         """
         try:
             from chronos import ChronosPipeline
-            from chronos.training import ChronosConfig, ChronosDataset
         except ImportError:
             raise ImportError(
-                "Fine-tuning requires: pip install amazon-chronos-t5 transformers accelerate"
+                "Fine-tuning requires: pip install chronos-forecasting transformers accelerate"
             )
 
         # Load pretrained weights if not already loaded
@@ -316,7 +327,6 @@ class ChronosForecaster(BaseForecaster):
             self._load_pipeline(checkpoint_dir)
 
         self._is_finetuned = True
-        self._ft_checkpoint = checkpoint_dir
         self.is_fitted = True
         self._logger.info("Fine-tuning complete.")
         return self
@@ -338,55 +348,14 @@ class ChronosForecaster(BaseForecaster):
         Returns:
             Array of shape (len(df), self.horizon) — median point forecasts.
         """
-        if self._pipeline is None:
-            # Zero-shot: load pretrained weights on first call
-            self._load_pipeline()
-            self.is_fitted = True
-
-        series = df[self.target_col].values.astype(np.float32)
-        n = len(series)
-
-        # Build context tensors: for each origin i, context = series[i-ctx:i]
-        # Origins that don't have enough history get left-padded with NaN
-        # (Chronos handles NaN as missing — pads internally with zeros)
-        ctx = self.context_length
-        contexts = []
-        for i in range(n):
-            start = max(0, i - ctx)
-            window = series[start:i]
-            if len(window) < ctx:
-                pad = np.full(ctx - len(window), np.nan, dtype=np.float32)
-                window = np.concatenate([pad, window])
-            contexts.append(torch.tensor(window, dtype=torch.float32))
-
-        # Stack into (N, ctx) tensor
-        context_tensor = torch.stack(contexts)  # (N, ctx)
-
-        self._logger.info(
-            "Running Chronos inference on %d origins (horizon=%d, ctx=%d) …",
-            n, self.horizon, ctx,
-        )
-
-        # Batch inference to prevent OOM
-        batch_size = 32
-        forecast_list = []
-        with torch.inference_mode():
-            for i in range(0, len(context_tensor), batch_size):
-                batch = context_tensor[i: i + batch_size]
-                f = self._pipeline.predict(
-                    batch,
-                    prediction_length=self.horizon,
-                    num_samples=self.num_samples,
-                    limit_prediction_length=False,
-                )
-                forecast_list.append(f.numpy())
-
-        # forecast shape: (N, num_samples, horizon) — take median across samples
-        forecast_np = np.concatenate(forecast_list, axis=0)
-        median = np.median(forecast_np, axis=1)  # (N, H)
-
-        self._logger.info("Inference complete.")
-        return median.astype(np.float32)
+        samples = self._forecast_samples(df, self.num_samples)
+        median = np.full((len(df), self.horizon), np.nan, dtype=np.float32)
+        valid = np.isfinite(samples).any(axis=(1, 2))
+        median[valid] = np.nanmedian(samples[valid], axis=1).astype(np.float32)
+        self.last_quantile_forecasts = {
+            q: _sample_quantile(samples, q) for q in self.quantile_levels
+        }
+        return median
 
     def predict_quantiles(
         self, df: pd.DataFrame
@@ -398,43 +367,44 @@ class ChronosForecaster(BaseForecaster):
             Dict mapping quantile level → array of shape (N, horizon).
             e.g. {0.1: lower_bound, 0.5: median, 0.9: upper_bound}
         """
+        samples = self._forecast_samples(df, max(self.num_samples, 100))
+        self.last_quantile_forecasts = {
+            q: _sample_quantile(samples, q) for q in self.quantile_levels
+        }
+        return self.last_quantile_forecasts
+
+    def _forecast_samples(self, df: pd.DataFrame, num_samples: int) -> np.ndarray:
+        """Return batched predictive samples while preserving origin ordering."""
         if self._pipeline is None:
             self._load_pipeline()
             self.is_fitted = True
 
-        series = df[self.target_col].values.astype(np.float32)
-        n, ctx = len(series), self.context_length
-        contexts = []
-        for i in range(n):
-            start = max(0, i - ctx)
-            window = series[start:i]
-            if len(window) < ctx:
-                pad = np.full(ctx - len(window), np.nan, dtype=np.float32)
-                window = np.concatenate([pad, window])
-            contexts.append(torch.tensor(window, dtype=torch.float32))
-
-        context_tensor = torch.stack(contexts)
-        # Batch inference for quantiles (smaller batch size due to more samples)
-        batch_size = 16
-        forecast_list = []
-        num_s = max(self.num_samples, 100)
-
+        series = df[self.target_col].to_numpy(dtype=np.float32)
+        samples = np.full(
+            (len(series), num_samples, self.horizon), np.nan, dtype=np.float32
+        )
+        started = time.perf_counter()
         with torch.inference_mode():
-            for i in range(0, len(context_tensor), batch_size):
-                batch = context_tensor[i: i + batch_size]
-                f = self._pipeline.predict(
-                    batch,
+            for start, contexts in iter_context_batches(
+                series, self.context_length, self.batch_size
+            ):
+                forecast = self._pipeline.predict(
+                    torch.from_numpy(contexts),
                     prediction_length=self.horizon,
-                    num_samples=num_s,
+                    num_samples=num_samples,
                     limit_prediction_length=False,
                 )
-                forecast_list.append(f.numpy())
+                batch = forecast.detach().cpu().numpy().astype(np.float32)
+                samples[start:start + len(batch)] = batch
 
-        forecast_np = np.concatenate(forecast_list, axis=0)   # (N, samples, H)
-        return {
-            q: np.quantile(forecast_np, q, axis=1).astype(np.float32)
-            for q in self.quantile_levels
-        }
+        self.last_runtime_seconds = time.perf_counter() - started
+        self._logger.info(
+            "Chronos-T5-small inference complete: target=%s, origins=%d, elapsed=%.2fs",
+            self.target_col,
+            max(0, len(series) - self.context_length),
+            self.last_runtime_seconds,
+        )
+        return samples
 
     # ── persistence ───────────────────────────────────────────────────────
 
@@ -456,6 +426,8 @@ class ChronosForecaster(BaseForecaster):
             "quantile_levels": self.quantile_levels,
             "is_finetuned":    self._is_finetuned,
             "device":          self.device,
+            "dtype":           self.dtype,
+            "batch_size":      self.batch_size,
         }
         with open(path / "meta.pkl", "wb") as f:
             pickle.dump(meta, f)
@@ -483,6 +455,8 @@ class ChronosForecaster(BaseForecaster):
             finetune_config=meta["finetune_config"],
             quantile_levels=meta["quantile_levels"],
             device=meta["device"],
+            dtype=meta.get("dtype", "auto"),
+            batch_size=meta.get("batch_size", 16),
         )
         instance._is_finetuned = meta["is_finetuned"]
 
@@ -498,13 +472,14 @@ class ChronosForecaster(BaseForecaster):
 
 # ── Training helpers ──────────────────────────────────────────────────────────
 
-def _auto_device() -> str:
-    """Pick the best available device."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
+def _sample_quantile(samples: np.ndarray, level: float) -> np.ndarray:
+    """Compute a sample quantile while retaining unavailable warmup rows."""
+    result = np.full(
+        (samples.shape[0], samples.shape[2]), np.nan, dtype=np.float32
+    )
+    valid = np.isfinite(samples).any(axis=(1, 2))
+    result[valid] = np.nanquantile(samples[valid], level, axis=1).astype(np.float32)
+    return result
 
 
 def _make_sliding_windows(

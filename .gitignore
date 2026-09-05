@@ -151,6 +151,7 @@ activemq-data/
 .env
 .envrc
 .venv
+.venv-moirai/
 env/
 venv/
 ENV/
@@ -219,5 +220,6 @@ __marimo__/
 
 # Project-specific ignores
 data/
+models/
 results/
 notebooks/05_scientific_plots.ipynb
