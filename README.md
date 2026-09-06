@@ -72,7 +72,8 @@ The notebook workflow is:
 2. `02_feature_engineering.ipynb` - calendar, weather, lag, rolling, and difference features
 3. `03_baselines.ipynb` - seasonal-naive, SARIMA, and XGBoost baselines
 4. `04_foundation.ipynb` - Chronos, TimesFM, and Moirai zero-shot benchmark
-5. Scientific visualization - final local plotting stage; exported figures are stored under `docs/figures/`
+
+Exported figures are stored under `docs/figures/`
 
 ## Data and forecast targets
 
@@ -297,9 +298,7 @@ Main generated artifacts include:
 - QUICK and FULL prediction artifacts
 - baseline and foundation-model metric registries
 - horizon-wise evaluation outputs
-- final scientific figures
 
-Large generated data, checkpoints, and experiment artifacts are intentionally kept out of Git where appropriate. The final README figures are tracked separately under `docs/figures/`.
 
 ## Summary
 
