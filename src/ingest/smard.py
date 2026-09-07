@@ -159,6 +159,30 @@ _MIN_CARBON_SOURCE_COVERAGE = 0.80
 SMARD_CACHE_VERSION = 2
 
 
+def _smard_cache_spec(start, end):
+    '''Return the request metadata that defines the processed SMARD cache.'''
+    return {
+        'version': SMARD_CACHE_VERSION,
+        'start': start,
+        'end': end or pd.Timestamp.utcnow().date().isoformat(),
+    }
+
+
+def smard_cache_is_complete(processed_dir, start, end):
+    '''Return whether processed SMARD metadata is complete for this request.'''
+    metadata_path = Path(processed_dir) / 'smard.meta.json'
+    try:
+        with open(metadata_path, encoding='utf-8') as f:
+            metadata = json.load(f)
+    except (OSError, ValueError):
+        return False
+    cache_spec = _smard_cache_spec(start, end)
+    return (
+        all(metadata.get(key) == value for key, value in cache_spec.items())
+        and metadata.get('complete') is True
+    )
+
+
 # ── Session factory ───────────────────────────────────────────────────────────
 
 def _make_session() -> requests.Session:
@@ -426,11 +450,7 @@ def load_smard(
     processed_dir.mkdir(parents=True, exist_ok=True)
     cache = processed_dir / "smard.parquet"
     cache_meta = processed_dir / "smard.meta.json"
-    cache_spec = {
-        "version": SMARD_CACHE_VERSION,
-        "start": start,
-        "end": end or pd.Timestamp.utcnow().date().isoformat(),
-    }
+    cache_spec = _smard_cache_spec(start, end)
 
     if cache.exists() and cache_meta.exists() and not force:
         try:

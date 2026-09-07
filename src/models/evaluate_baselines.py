@@ -1,10 +1,8 @@
 """
 Baseline evaluation harness.
 
-Runs SARIMA and XGBoost against the configured targets, collects metrics into
-a ResultsRegistry, and produces publication-ready comparison tables and
-plots. This is the script you run to generate the benchmark numbers that
-all future Phase 4 (foundation) models must beat.
+Runs XGBoost against the configured targets and the canonical load-only
+SARIMA comparator, then collects metrics into comparison tables and plots.
 
 Usage (from repo root):
     python -m src.models.evaluate_baselines
@@ -30,6 +28,10 @@ import pandas as pd
 from src.features.pipeline import TARGET_COLS, build_features, get_feature_cols
 from src.features.scaling import split_and_scale
 from src.models.arima import SARIMAForecaster
+from src.models.foundation_utils import (
+    build_context_actuals,
+    foundation_input_fingerprint,
+)
 from src.models.metrics import (
     MetricResult,
     ResultsRegistry,
@@ -57,12 +59,35 @@ VAL_END   = "2022-12-31"
 # Everything after VAL_END is the test set
 
 HORIZON = 24   # hours ahead
+CONTEXT_LENGTH = 168
+BENCHMARK_SET = 'final_six_v1'
 
 # Set to False to skip SARIMA (much slower than XGBoost)
 RUN_SARIMA = True
 
-# SARIMA: set auto_order=False for a quick run using fixed (2,1,2)(1,1,1,24)
-SARIMA_AUTO_ORDER = True
+# The final benchmark uses fixed-order SARIMA for load only. Automatic order
+# selection remains available as an explicit optional experiment.
+SARIMA_TARGETS = ['load_mw']
+SARIMA_AUTO_ORDER = False
+
+
+def _target_benchmark_fingerprint(target, history, evaluation, horizon):
+    contexts, actuals = build_context_actuals(
+        history[target].tail(CONTEXT_LENGTH).to_numpy(),
+        evaluation[target].to_numpy(),
+        CONTEXT_LENGTH,
+        horizon,
+    )
+    return foundation_input_fingerprint(
+        target=target,
+        origins_ns=evaluation.index.asi8,
+        contexts=contexts,
+        actuals=actuals,
+        benchmark_set=BENCHMARK_SET,
+        run_mode='full',
+        context_length=CONTEXT_LENGTH,
+        horizon=horizon,
+    )
 
 
 # ── Main entry point ──────────────────────────────────────────────────────────
@@ -77,6 +102,7 @@ def run_baseline_evaluation(
     run_sarima: bool    = RUN_SARIMA,
     sarima_auto: bool   = SARIMA_AUTO_ORDER,
     targets: list[str]  = TARGET_COLS,
+    sarima_targets: list[str] | None = None,
 ) -> pd.DataFrame:
     """
     Full baseline evaluation pipeline.
@@ -132,6 +158,13 @@ def run_baseline_evaluation(
             ("test", test, val),
         ]:
             result = xgb_model.evaluate(split_df, split_name=split_name, history_df=history)
+            result.meta.update(
+                run_mode='full',
+                benchmark_set=BENCHMARK_SET,
+                input_fingerprint=_target_benchmark_fingerprint(
+                    target, history, split_df, horizon
+                ),
+            )
             registry.add(result)
 
             # Horizon error curve
@@ -165,7 +198,13 @@ def run_baseline_evaluation(
         logger.info("BASELINE 2: SARIMA (univariate recursive)")
         logger.info("=" * 60)
 
-        for target in targets:
+        requested_sarima_targets = (
+            SARIMA_TARGETS if sarima_targets is None else sarima_targets
+        )
+        resolved_sarima_targets = [
+            target for target in requested_sarima_targets if target in targets
+        ]
+        for target in resolved_sarima_targets:
             logger.info("  Target: %s", target)
 
             sarima = SARIMAForecaster(
@@ -196,6 +235,11 @@ def run_baseline_evaluation(
                     horizon=horizon,
                     y_true=y_true,
                     y_pred=preds[:, 0],
+                    run_mode='full',
+                    benchmark_set=BENCHMARK_SET,
+                    input_fingerprint=_target_benchmark_fingerprint(
+                        target, train if history is None else history, split_df, horizon
+                    ),
                 )
                 registry.add(result)
 
@@ -327,18 +371,24 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Run baseline model evaluation.")
     parser.add_argument("--no-sarima",  action="store_true", help="Skip SARIMA (faster)")
-    parser.add_argument("--no-auto",    action="store_true", help="Use fixed SARIMA order")
+    parser.add_argument(
+        '--auto-sarima-order',
+        action='store_true',
+        help='Explicitly enable automatic SARIMA order selection.',
+    )
     parser.add_argument("--horizon",    type=int, default=24, help="Forecast horizon (hours)")
     parser.add_argument("--targets",    nargs="+", default=TARGET_COLS)
+    parser.add_argument('--sarima-targets', nargs='+', default=SARIMA_TARGETS)
     parser.add_argument("--train-end",  default=TRAIN_END)
     parser.add_argument("--val-end",    default=VAL_END)
     args = parser.parse_args()
 
     run_baseline_evaluation(
         run_sarima=not args.no_sarima,
-        sarima_auto=not args.no_auto,
+        sarima_auto=args.auto_sarima_order,
         horizon=args.horizon,
         targets=args.targets,
+        sarima_targets=args.sarima_targets,
         train_end=args.train_end,
         val_end=args.val_end,
     )

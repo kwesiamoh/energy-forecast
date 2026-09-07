@@ -38,6 +38,7 @@ Usage:
 """
 
 import io
+import json
 import logging
 import zipfile
 from pathlib import Path
@@ -99,6 +100,25 @@ STATIONS = [
 METEOSTAT_COLS = ["temp", "rhum", "prcp", "wspd", "wdir", "pres", "tsun", "cldc"]
 
 # DWD Open Data base URL for hourly sunshine
+METEOSTAT_CACHE_VERSION = 1
+
+
+def _meteostat_cache_spec(start, end):
+    '''Return inputs which define the processed cache.'''
+    return {
+        'version': METEOSTAT_CACHE_VERSION,
+        'start': start,
+        'end': end or pd.Timestamp.utcnow().date().isoformat(),
+        'drop_tsun_if_sparse': DROP_TSUN_IF_SPARSE,
+        'tsun_max_nan_frac': TSUN_MAX_NAN_FRAC,
+        'meteostat_columns': list(METEOSTAT_COLS),
+        'stations': [[s[0], s[1], s[5]] for s in STATIONS],
+    }
+
+
+def _meteostat_cache_is_valid(metadata, cache_spec):
+    '''Return whether cached weather matches the exact request/config.'''
+    return metadata == cache_spec
 DWD_BASE = "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/hourly/sunshine/historical"
 
 
@@ -392,11 +412,22 @@ def load_meteostat(
     """
     processed_dir = Path(processed_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
+    cache_meta = processed_dir / 'meteostat.meta.json'
+    cache_spec = _meteostat_cache_spec(start, end)
     cache = processed_dir / "meteostat.parquet"
 
-    if cache.exists() and not force:
-        logger.info("Loading cached Meteostat parquet from %s", cache)
-        return pd.read_parquet(cache)
+    if cache.exists() and cache_meta.exists() and not force:
+        try:
+            with open(cache_meta, encoding='utf-8') as f:
+                metadata = json.load(f)
+            if _meteostat_cache_is_valid(metadata, cache_spec):
+                logger.info('Loading cached Meteostat parquet from %s', cache)
+                return pd.read_parquet(cache)
+            logger.info('Meteostat cache metadata does not match; rebuilding.')
+        except (OSError, ValueError):
+            logger.warning('Meteostat cache metadata is unreadable; rebuilding.')
+    elif cache.exists() and not force:
+        logger.info('Meteostat cache metadata is missing; rebuilding.')
 
     # Log the effective configuration so the user can see what will happen
     logger.info(
@@ -494,5 +525,7 @@ def load_meteostat(
     )
 
     result.to_parquet(cache)
+    with open(cache_meta, 'w', encoding='utf-8') as f:
+        json.dump(cache_spec, f, indent=2)
     logger.info("Cached Meteostat parquet → %s", cache)
     return result

@@ -60,10 +60,10 @@ import pandas as pd
 
 from .meteostat import load_meteostat
 from .opsd import load_opsd
-from .smard import load_smard
+from .smard import load_smard, smard_cache_is_complete
 
 logger = logging.getLogger(__name__)
-MASTER_CACHE_VERSION = 2
+MASTER_CACHE_VERSION = 3
 
 GAP_FILL_LIMIT = 3  # hours — forward-fill gaps no longer than this
 
@@ -78,6 +78,16 @@ _OPSD_SMARD_BACKFILL_MAP: dict[str, str] = {
     # Extend here if OPSD gains extra columns in a future release:
     # "biomass_mw": "biomass_mwh",
 }
+
+
+def _master_cache_is_valid(metadata, cache_spec, smard_complete):
+    '''Return whether a master cache has exact config and complete sources.'''
+    return (
+        metadata.get('cache_spec') == cache_spec
+        and metadata.get('complete') is True
+        and metadata.get('source_completeness', {}).get('smard') is True
+        and smard_complete is True
+    )
 
 
 def _backfill_opsd_from_smard(
@@ -173,7 +183,12 @@ def build_master(
         try:
             with open(meta_cache, encoding="utf-8") as f:
                 cached_spec = json.load(f)
-            if cached_spec == cache_spec:
+            smard_complete = smard_cache_is_complete(
+                processed_dir, start, end
+            )
+            if _master_cache_is_valid(
+                cached_spec, cache_spec, smard_complete
+            ):
                 logger.info("Loading cached master dataset from %s", master_cache)
                 return pd.read_parquet(master_cache)
         except (OSError, ValueError):
@@ -185,6 +200,12 @@ def build_master(
 
     logger.info("Loading SMARD …")
     smard = load_smard(raw_dir, processed_dir, start=start, end=end, force=force)
+    smard_complete = smard_cache_is_complete(processed_dir, start, end)
+    if not smard_complete:
+        raise RuntimeError(
+            'SMARD retrieval is incomplete for the requested period; '
+            'master cache was not created. Rerun Phase 1 to resume missing chunks.'
+        )
 
     logger.info("Loading Meteostat …")
     weather = load_meteostat(processed_dir, start=start, end=end, force=force)
@@ -252,7 +273,15 @@ def build_master(
     master.to_parquet(master_cache)
     missing_mask.to_parquet(mask_cache)
     with open(meta_cache, "w", encoding="utf-8") as f:
-        json.dump(cache_spec, f, indent=2)
+        json.dump(
+            {
+                'cache_spec': cache_spec,
+                'complete': True,
+                'source_completeness': {'smard': smard_complete},
+            },
+            f,
+            indent=2,
+        )
     logger.info("Saved master → %s", master_cache)
     logger.info("Saved missing mask → %s", mask_cache)
 

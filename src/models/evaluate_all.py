@@ -13,6 +13,10 @@ import pandas as pd
 
 from src.features.pipeline import TARGET_COLS, build_features, get_feature_cols
 from src.features.scaling import split_and_scale
+from src.models.foundation_utils import (
+    build_context_actuals,
+    foundation_input_fingerprint,
+)
 from src.models.metrics import (
     MetricResult,
     ResultsRegistry,
@@ -36,6 +40,7 @@ VAL_END = "2022-12-31"
 HORIZON = 24
 CONTEXT_LENGTH = 168
 QUICK_ROWS = 500
+SARIMA_TARGETS = ['load_mw']
 
 MODEL_CHOICES = [
     "seasonal_naive_24",
@@ -46,6 +51,27 @@ MODEL_CHOICES = [
     "timesfm",
     "moirai2",
 ]
+
+
+def _target_benchmark_fingerprint(target, val, test, horizon, quick):
+    contexts, actuals = build_context_actuals(
+        val[target].tail(CONTEXT_LENGTH).to_numpy(),
+        test[target].to_numpy(),
+        CONTEXT_LENGTH,
+        horizon,
+    )
+    return foundation_input_fingerprint(
+        target=target,
+        origins_ns=test.index.asi8,
+        contexts=contexts,
+        actuals=actuals,
+        benchmark_set='final_six_v1',
+        run_mode='quick' if quick else 'full',
+        context_length=CONTEXT_LENGTH,
+        horizon=horizon,
+    )
+
+
 def run_all_evaluations(
     processed_dir: Path = PROCESSED_DIR,
     models_dir: Path = MODELS_DIR,
@@ -190,6 +216,9 @@ def _eval_xgboost(
             run_mode="quick" if quick else "full",
             elapsed_evaluation_seconds=time.perf_counter() - started,
             benchmark_set="final_six_v1",
+            input_fingerprint=_target_benchmark_fingerprint(
+                target, val, test, horizon, quick
+            ),
         )
         registry.add(result)
         _save_horizon_plot(
@@ -207,7 +236,7 @@ def _eval_sarima(
         return
 
     baseline_dir = models_dir / "baselines"
-    for target in targets:
+    for target in (target for target in SARIMA_TARGETS if target in targets):
         checkpoint = baseline_dir / f"sarima_{target}.pkl"
         if not checkpoint.exists():
             logger.warning("SARIMA checkpoint not found for %s; skipping.", target)
@@ -227,6 +256,9 @@ def _eval_sarima(
             run_mode="quick" if quick else "full",
             elapsed_evaluation_seconds=time.perf_counter() - started,
             benchmark_set="final_six_v1",
+            input_fingerprint=_target_benchmark_fingerprint(
+                target, val, test, horizon, quick
+            ),
         )
         registry.add(result)
 
@@ -328,6 +360,9 @@ def _evaluate_predictions(
         run_mode="quick" if quick else "full",
         elapsed_evaluation_seconds=elapsed,
         benchmark_set="final_six_v1",
+        input_fingerprint=_target_benchmark_fingerprint(
+            target, val, test, horizon, quick
+        ),
     )
     return result, predictions
 
@@ -346,6 +381,10 @@ def _build_leaderboard(df: pd.DataFrame, quick: bool) -> pd.DataFrame:
     if "quick" in test_df:
         mode = test_df["quick"].fillna(False).astype(bool)
         test_df = test_df[mode if quick else ~mode]
+    test_df = test_df[
+        (test_df['model'] != 'sarima')
+        | test_df['target'].isin(SARIMA_TARGETS)
+    ]
     columns = [
         "model",
         "target",
